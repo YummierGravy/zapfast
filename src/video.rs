@@ -186,9 +186,9 @@ struct Sound {
 impl Sound {
     /// Opens the file's sound, paused at `from`. A video without a sound
     /// track, or a computer without an output device, plays silently.
-    fn open(path: &Path, from: Duration, muted: bool) -> Option<Self> {
+    fn open(path: &Path, from: Duration, muted: bool, speaker: &str) -> Option<Self> {
         let decoder = sound_decoder(path, from)?;
-        let device = match crate::audio::open_output() {
+        let device = match crate::audio::open_output(speaker) {
             Ok(device) => device,
             Err(error) => {
                 log::warn!("video plays without sound: {error}");
@@ -346,6 +346,8 @@ pub struct Player {
     /// Whether videos open the sound device. Tests and demo screenshots
     /// play silently.
     audible: bool,
+    /// Speaker from Settings. Empty follows the system default.
+    speaker: String,
     /// When the playing video's message was last drawn on screen.
     seen: Cell<Instant>,
     /// Longest side frames are decoded to: larger while the video covers
@@ -360,6 +362,7 @@ impl Player {
             session: None,
             muted: false,
             audible: true,
+            speaker: String::new(),
             seen: Cell::new(Instant::now()),
             side: MAX_SIDE,
         }
@@ -369,6 +372,18 @@ impl Player {
     #[cfg(any(test, feature = "demo"))]
     pub fn silence(&mut self) {
         self.audible = false;
+    }
+
+    /// Uses this speaker the next time a video opens its sound. An empty name
+    /// follows the system default.
+    pub fn set_speaker(&mut self, speaker: &str) {
+        if self.speaker == speaker {
+            return;
+        }
+        self.speaker = speaker.to_owned();
+        if let Some(session) = self.session.as_mut() {
+            session.sound = None;
+        }
     }
 
     /// Plays or pauses a message's video, starting it when another one (or
@@ -564,7 +579,7 @@ impl Player {
             clock,
             sound: self
                 .audible
-                .then(|| Sound::open(path, from, self.muted))
+                .then(|| Sound::open(path, from, self.muted, &self.speaker))
                 .flatten(),
             total: Duration::ZERO,
             side: self.side,

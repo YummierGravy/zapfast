@@ -115,6 +115,21 @@ name or description, in the interface language or in English.
 - **Locked chats code**: the local code that opens the **Locked** tab. It hides
   chats and adds no encryption beyond the encrypted message archive.
 
+**Calls**
+
+- **Microphone**: used for calls and voice messages. **System default** follows
+  the computer's default input.
+- **Speaker**: used for calls, the ringtone, playback, and notification sounds.
+- **Camera**: used when you place, answer, or switch to a video call. Linux
+  only. Empty uses the first camera. The picture sent is a portrait crop of the
+  center, so a phone shows it upright.
+
+The same choices are on the call bar, under **Devices**, while a call is up.
+When PipeWire is running, the lists are its speakers and microphones, and a
+call opens the one you pick through PipeWire, so another program can use the
+same headset. Otherwise Linux offers one entry per sound card and each HDMI
+or DisplayPort output with a monitor attached.
+
 **Notifications**
 
 - **Desktop notifications**: for chats you are not looking at. Muted chats stay

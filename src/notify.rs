@@ -111,6 +111,8 @@ pub struct Notifications {
     /// What unit tests would have shown, recorded instead of shown on the
     /// desktop. Always empty outside tests.
     pub shown: Vec<Shown>,
+    /// Speaker for notification sounds. Empty follows the system default.
+    speaker: String,
 }
 
 /// A notification a unit test asked for.
@@ -125,6 +127,12 @@ pub struct Shown {
 }
 
 impl Notifications {
+    /// Plays later notification sounds on this speaker. Empty follows the
+    /// system default.
+    pub fn set_speaker(&mut self, speaker: &str) {
+        self.speaker = speaker.to_owned();
+    }
+
     /// Registers a chat's notification; delivery registers through `show`.
     #[cfg(test)]
     fn register(
@@ -242,11 +250,12 @@ impl Notifications {
             });
             return;
         }
+        let speaker = self.speaker.clone();
         let spawned = std::thread::Builder::new()
             .name("notification".into())
             .spawn(move || {
                 let system_sound = sound == NotificationSound::System;
-                play_sound(sound);
+                play_sound(sound, &speaker);
                 deliver(
                     &title,
                     &body,
@@ -270,7 +279,7 @@ const ALERT: &[u8] = include_bytes!("../assets/sounds/alert.wav");
 
 /// Plays a notification sound on its own thread, for notifications and
 /// their preview in Settings. System sounds and silence play nothing here.
-pub fn play_sound(sound: NotificationSound) {
+pub fn play_sound(sound: NotificationSound, speaker: &str) {
     let source: Box<dyn Fn() -> std::io::Result<Box<dyn ReadSeek>> + Send> = match sound {
         NotificationSound::Receive => Box::new(|| Ok(Box::new(std::io::Cursor::new(RECEIVE)))),
         NotificationSound::Alert => Box::new(|| Ok(Box::new(std::io::Cursor::new(ALERT)))),
@@ -281,13 +290,15 @@ pub fn play_sound(sound: NotificationSound) {
         }),
         NotificationSound::System | NotificationSound::None => return,
     };
+    let speaker = speaker.to_owned();
     let spawned = std::thread::Builder::new()
         .name("notification-sound".into())
         .spawn(move || {
             let played = (|| -> Result<(), String> {
                 let reader = source().map_err(|error| error.to_string())?;
                 let decoder = rodio::Decoder::new(reader).map_err(|error| error.to_string())?;
-                let device = crate::audio::open_output().map_err(|error| error.to_string())?;
+                let device =
+                    crate::audio::open_output(&speaker).map_err(|error| error.to_string())?;
                 let player = rodio::Player::connect_new(device.mixer());
                 player.append(decoder);
                 player.sleep_until_end();

@@ -3,8 +3,12 @@
 //! Input and output devices are opened on demand and released when idle.
 
 use std::collections::HashMap;
+#[cfg(not(target_os = "linux"))]
+use std::collections::VecDeque;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +32,318 @@ fn rate() -> NonZero<u32> {
     NonZero::new(voice::RATE).expect("48 kHz is not zero")
 }
 
+/// Microphone, speaker, and camera chosen in Settings. An empty name follows
+/// the system default (the first camera, on Linux).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallDevices {
+    pub microphone: String,
+    pub speaker: String,
+    pub camera: String,
+}
+
+/// Names the settings pickers can offer. Listing can take a moment, so it
+/// runs off the interface thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceList {
+    pub microphones: Vec<String>,
+    pub speakers: Vec<String>,
+    pub cameras: Vec<String>,
+}
+
+/// The input, output, and camera devices this computer has right now.
+pub fn list_devices() -> DeviceList {
+    let (microphones, speakers) = match pipewire_endpoints() {
+        Some(endpoints) => (
+            endpoint_labels(&endpoints, true),
+            endpoint_labels(&endpoints, false),
+        ),
+        None => (
+            inputs().into_iter().map(|(name, _)| name).collect(),
+            outputs().into_iter().map(|(name, _)| name).collect(),
+        ),
+    };
+    DeviceList {
+        microphones,
+        speakers,
+        cameras: crate::call_camera::cameras(),
+    }
+}
+
+/// `(name, driver)` of a cpal device. On ALSA the driver is the PCM id.
+fn describe(device: &rodio::Device) -> Option<(String, Option<String>)> {
+    use rodio::DeviceTrait;
+    let description = device.description().ok()?;
+    Some((
+        description.name().to_string(),
+        description.driver().map(str::to_owned),
+    ))
+}
+
+fn outputs() -> Vec<(String, rodio::Device)> {
+    use rodio::cpal::traits::HostTrait;
+    let Ok(devices) = rodio::cpal::default_host().output_devices() else {
+        return Vec::new();
+    };
+    choices(devices.filter_map(|device| {
+        let (name, driver) = describe(&device)?;
+        Some((name, driver, device))
+    }))
+}
+
+fn inputs() -> Vec<(String, rodio::microphone::Input)> {
+    let Ok(inputs) = rodio::microphone::available_inputs() else {
+        return Vec::new();
+    };
+    choices(inputs.into_iter().filter_map(|input| {
+        let (name, driver) = describe(&input.clone().into_inner())?;
+        Some((name, driver, input))
+    }))
+}
+
+/// The devices worth offering, each under one name.
+///
+/// ALSA lists every PCM of every card: surround layouts, S/PDIF, raw `hw`
+/// and `plughw`, `dmix`, resamplers, and the sound servers. A desktop has
+/// four or five devices and that comes to a hundred entries. Keep one per
+/// card (its `sysdefault`, else `front`) and each HDMI output; the sound
+/// server is what **System default** already plays through.
+fn choices<T>(devices: impl Iterator<Item = (String, Option<String>, T)>) -> Vec<(String, T)> {
+    let mut kept: Vec<(String, u8, String, T)> = Vec::new();
+    for (name, driver, device) in devices {
+        if name.is_empty() || driver.as_deref() == Some("null") {
+            continue;
+        }
+        let (key, rank, name) = if cfg!(target_os = "linux") {
+            let Some(pcm) = driver.as_deref() else {
+                continue;
+            };
+            let Some((key, rank, card)) = alsa_choice(pcm) else {
+                continue;
+            };
+            if pcm.starts_with("hdmi:") && unplugged_hdmi(&name) {
+                continue;
+            }
+            // A card's `front` PCM can be described only by its purpose.
+            let name = if name.contains(',') {
+                name
+            } else {
+                format!("{card}, {name}")
+            };
+            (key, rank, name)
+        } else {
+            (name.clone(), 0, name)
+        };
+        match kept.iter_mut().find(|entry| entry.0 == key) {
+            Some(entry) if rank < entry.1 => *entry = (key, rank, name, device),
+            Some(_) => {}
+            None => kept.push((key, rank, name, device)),
+        }
+    }
+    let mut out: Vec<(String, T)> = Vec::new();
+    for (_, _, name, device) in kept {
+        if !out.iter().any(|(seen, _)| *seen == name) {
+            out.push((name, device));
+        }
+    }
+    out
+}
+
+/// Which card an ALSA PCM id stands for, how good a stand-in it is (lower is
+/// better), and the card's id. `None` for PCMs not worth offering.
+fn alsa_choice(pcm: &str) -> Option<(String, u8, String)> {
+    let (kind, rest) = pcm.split_once(':')?;
+    let card = rest
+        .split(',')
+        .find_map(|part| part.strip_prefix("CARD="))?
+        .to_owned();
+    match kind {
+        "sysdefault" => Some((card.clone(), 0, card)),
+        "front" => Some((card.clone(), 1, card)),
+        "hdmi" => Some((pcm.to_owned(), 0, card)),
+        _ => None,
+    }
+}
+
+/// The kernel names an HDMI or DisplayPort output after the monitor on it,
+/// and leaves a port with nothing attached as "HDMI 0", "HDMI 1", and so on.
+fn unplugged_hdmi(name: &str) -> bool {
+    let port = name.rsplit(", ").next().unwrap_or(name);
+    port.strip_prefix("HDMI ")
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn named_output(name: &str) -> Option<rodio::Device> {
+    if name.is_empty() {
+        return None;
+    }
+    outputs()
+        .into_iter()
+        .find(|(shown, _)| shown == name)
+        .map(|(_, device)| device)
+}
+
+fn named_input(name: &str) -> Option<rodio::microphone::Input> {
+    if name.is_empty() {
+        return None;
+    }
+    inputs()
+        .into_iter()
+        .find(|(shown, _)| shown == name)
+        .map(|(_, input)| input)
+}
+
+/// One PipeWire sink or source: the label Settings shows, and the node name
+/// the sound server opens.
+struct PwEndpoint {
+    label: String,
+    target: String,
+    input: bool,
+}
+
+fn endpoint_labels(endpoints: &[PwEndpoint], input: bool) -> Vec<String> {
+    endpoints
+        .iter()
+        .filter(|endpoint| endpoint.input == input)
+        .map(|endpoint| endpoint.label.clone())
+        .collect()
+}
+
+/// PipeWire's sinks and sources, when the sound server is running.
+///
+/// `None` when `pw-dump` is missing or fails, so a machine without PipeWire
+/// keeps the ALSA list. Opening one of these by its ALSA `sysdefault` name
+/// asks dsnoop for the hardware, which fails while PipeWire already holds
+/// the headset (`unable to open slave`).
+fn pipewire_endpoints() -> Option<Vec<PwEndpoint>> {
+    let output = std::process::Command::new("pw-dump")
+        .arg("Node")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(parse_pipewire_dump(&text))
+}
+
+fn parse_pipewire_dump(json: &str) -> Vec<PwEndpoint> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(nodes) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut endpoints = Vec::new();
+    for node in nodes {
+        let props = &node["info"]["props"];
+        let input = match props["media.class"].as_str() {
+            Some("Audio/Source") => true,
+            Some("Audio/Sink") => false,
+            _ => continue,
+        };
+        let Some(target) = props["node.name"].as_str() else {
+            continue;
+        };
+        if target.ends_with(".monitor") {
+            continue;
+        }
+        let Some(label) = props["node.description"]
+            .as_str()
+            .filter(|label| !label.is_empty())
+        else {
+            continue;
+        };
+        if endpoints
+            .iter()
+            .any(|endpoint: &PwEndpoint| endpoint.input == input && endpoint.label == label)
+        {
+            continue;
+        }
+        endpoints.push(PwEndpoint {
+            label: label.to_owned(),
+            target: target.to_owned(),
+            input,
+        });
+    }
+    endpoints
+}
+
+/// Opens an audio device with `PIPEWIRE_NODE` naming `node`, or as the user
+/// started ZapFast when `node` is `None`.
+///
+/// The PipeWire ALSA plugin, behind both the `pipewire` and the `default`
+/// PCM, reads that variable when a PCM opens. A call opens its microphone
+/// and its speaker at the same moment, and a ringtone or notification can
+/// open beside them, so every open goes through this lock: otherwise a
+/// speaker opening while the microphone's node is set attaches to the
+/// microphone, never runs, and stalls the call's whole receive path.
+fn with_pipewire_node<T>(node: Option<&str>, open: impl FnOnce() -> T) -> T {
+    static OPEN: Mutex<()> = Mutex::new(());
+    static STARTED_WITH: std::sync::OnceLock<Option<std::ffi::OsString>> =
+        std::sync::OnceLock::new();
+    let _guard = OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let original = STARTED_WITH.get_or_init(|| std::env::var_os("PIPEWIRE_NODE"));
+    let set = |value: Option<&std::ffi::OsStr>| {
+        // SAFETY: only called with `OPEN` held. ZapFast changes this variable
+        // nowhere else, and the plugin reads it while a PCM opens, which
+        // happens inside this same critical section.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var("PIPEWIRE_NODE", value),
+                None => std::env::remove_var("PIPEWIRE_NODE"),
+            }
+        }
+    };
+    match node {
+        Some(node) => set(Some(std::ffi::OsStr::new(node))),
+        None => set(original.as_deref()),
+    }
+    let result = open();
+    set(original.as_deref());
+    result
+}
+
+/// The `pipewire` playback PCM, which is what `PIPEWIRE_NODE` selects through.
+fn pipewire_output() -> Option<rodio::Device> {
+    use rodio::cpal::traits::HostTrait;
+    rodio::cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|device| {
+            describe(device).and_then(|(_, driver)| driver).as_deref() == Some("pipewire")
+        })
+}
+
+/// The `pipewire` capture PCM.
+fn pipewire_input() -> Option<rodio::microphone::Input> {
+    rodio::microphone::available_inputs()
+        .ok()?
+        .into_iter()
+        .find(|input| {
+            describe(&input.clone().into_inner())
+                .and_then(|(_, driver)| driver)
+                .as_deref()
+                == Some("pipewire")
+        })
+}
+
+/// cpal reports a PipeWire timestamp a fraction of a millisecond behind the
+/// trigger as a stream error, and skips writing that period. Say so once.
+/// Call audio does not use this path; ringtones and message playback do.
+fn stream_error(error: rodio::cpal::StreamError) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    let message = error.to_string();
+    if message.contains("was earlier than get_trigger_htstamp")
+        && REPORTED.swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    log::warn!("audio stream error: {message}");
+}
+
 /// Opens the default output device for playback.
 ///
 /// rodio reports the sink's drop through `stderr` by default. A desktop launch
@@ -36,10 +352,54 @@ fn rate() -> NonZero<u32> {
 /// the next write there fails with `Broken pipe` and the print macro panics,
 /// which aborts the whole app in a release build. Keep it off, and report
 /// failures of our own through the log instead.
-pub fn open_output() -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
-    let mut output = rodio::DeviceSinkBuilder::open_default_sink()?;
+pub fn open_output(preferred: &str) -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
+    if !preferred.is_empty() {
+        match pipewire_endpoints() {
+            Some(endpoints) => {
+                let target = endpoints
+                    .iter()
+                    .find(|endpoint| !endpoint.input && endpoint.label == preferred)
+                    .map(|endpoint| endpoint.target.clone());
+                if let (Some(target), Some(device)) = (target, pipewire_output()) {
+                    let opened = with_pipewire_node(Some(&target), || open_device_output(device));
+                    if opened.is_ok() {
+                        return opened;
+                    }
+                }
+            }
+            None => {
+                if let Some(device) = named_output(preferred) {
+                    let opened = with_pipewire_node(None, || open_device_output(device));
+                    if opened.is_ok() {
+                        return opened;
+                    }
+                }
+            }
+        }
+    }
+    with_pipewire_node(None, open_default_output)
+}
+
+fn open_device_output(
+    device: rodio::Device,
+) -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
+    let mut output = rodio::DeviceSinkBuilder::from_device(device)?
+        .with_error_callback(stream_error)
+        .open_stream()?;
     output.log_on_drop(false);
     Ok(output)
+}
+
+fn open_default_output() -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
+    use rodio::cpal::traits::HostTrait;
+    match rodio::cpal::default_host().default_output_device() {
+        Some(device) => open_device_output(device),
+        None => {
+            let mut output = rodio::DeviceSinkBuilder::open_default_sink()?;
+            output.log_on_drop(false);
+            Ok(output)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +484,8 @@ pub struct Player {
     bars: HashMap<String, Vec<u8>>,
     /// Message whose clip just played to its end, waiting to be taken.
     finished: Option<String>,
+    /// Speaker from Settings. Empty follows the system default.
+    speaker: String,
 }
 
 struct Loaded {
@@ -174,7 +536,18 @@ impl Player {
             stretching: None,
             bars: HashMap::new(),
             finished: None,
+            speaker: String::new(),
         }
+    }
+
+    /// Uses this speaker the next time a clip opens the output. An empty name
+    /// follows the system default. A change closes the device a clip has open.
+    pub fn set_speaker(&mut self, speaker: &str) {
+        if self.speaker == speaker {
+            return;
+        }
+        self.speaker = speaker.to_owned();
+        self.output = None;
     }
 
     /// Current playback speed multiplier.
@@ -486,7 +859,8 @@ impl Player {
         let total = clip_length(loaded.samples.len());
         let offset = ((fraction.clamp(0.0, 1.0) * buffer.len() as f32) as usize).min(buffer.len());
         if self.output.is_none() {
-            let device = open_output().map_err(|error| format!("No sound output: {error}"))?;
+            let device =
+                open_output(&self.speaker).map_err(|error| format!("No sound output: {error}"))?;
             let sink = rodio::Player::connect_new(device.mixer());
             self.output = Some((device, sink));
         }
@@ -534,11 +908,8 @@ fn decode_file(path: &Path) -> Result<Vec<f32>, String> {
 
 type Outcome = Arc<Mutex<Option<Result<Vec<f32>, String>>>>;
 
-/// Records until told to stop, pushing a level per 50 ms, and returns the
-/// mono 48 kHz samples.
-type Take = fn(&AtomicBool, &Mutex<Vec<f32>>, &Waker) -> Result<Vec<f32>, String>;
-
-/// Records from the default microphone until told to stop.
+/// Records from the chosen microphone until told to stop. An empty name
+/// follows the system default.
 pub struct Recorder {
     started: Instant,
     stop: Arc<AtomicBool>,
@@ -549,8 +920,10 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(waker: Waker) -> Self {
-        Self::spawn(waker, record)
+    pub fn start(waker: Waker, microphone: String) -> Self {
+        Self::spawn(waker, move |stop, levels, waker| {
+            record(stop, levels, waker, &microphone)
+        })
     }
 
     /// Records a synthetic voice instead of the microphone, at the pace a
@@ -561,7 +934,12 @@ impl Recorder {
         Self::spawn(waker, rehearse)
     }
 
-    fn spawn(waker: Waker, body: Take) -> Self {
+    fn spawn(
+        waker: Waker,
+        body: impl FnOnce(&AtomicBool, &Mutex<Vec<f32>>, &Waker) -> Result<Vec<f32>, String>
+        + Send
+        + 'static,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let levels: Arc<Mutex<Vec<f32>>> = Default::default();
         let outcome: Outcome = Default::default();
@@ -682,19 +1060,63 @@ fn rehearse(
     Ok(samples)
 }
 
-/// Opens the default microphone in its own format.
-fn open_microphone() -> Result<rodio::microphone::Microphone, String> {
-    rodio::microphone::MicrophoneBuilder::new()
-        .default_device()
-        .map_err(|error| format!("No microphone available: {error}"))?
+/// Opens `preferred` when it is connected, otherwise the default microphone.
+/// A name that is no longer connected, such as one saved before the lists
+/// changed, opens the default rather than failing the call.
+fn open_microphone(preferred: &str) -> Result<rodio::microphone::Microphone, String> {
+    if !preferred.is_empty() {
+        match pipewire_endpoints() {
+            Some(endpoints) => {
+                let target = endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.input && endpoint.label == preferred)
+                    .map(|endpoint| endpoint.target.clone());
+                if let (Some(target), Some(input)) = (target, pipewire_input()) {
+                    match with_pipewire_node(Some(&target), || open_input(Some(input))) {
+                        Ok(microphone) => return Ok(microphone),
+                        Err(error) => log::warn!("{error}; using the default microphone"),
+                    }
+                }
+            }
+            None => {
+                if let Some(input) = named_input(preferred) {
+                    match with_pipewire_node(None, || open_input(Some(input))) {
+                        Ok(microphone) => return Ok(microphone),
+                        Err(error) => log::warn!("{error}; using the default microphone"),
+                    }
+                }
+            }
+        }
+    }
+    with_pipewire_node(None, || open_input(None))
+}
+
+fn open_input(
+    input: Option<rodio::microphone::Input>,
+) -> Result<rodio::microphone::Microphone, String> {
+    let builder = rodio::microphone::MicrophoneBuilder::new();
+    let builder = match input {
+        Some(input) => builder
+            .device(input)
+            .map_err(|error| format!("Could not use that microphone: {error}"))?,
+        None => builder
+            .default_device()
+            .map_err(|error| format!("No microphone available: {error}"))?,
+    };
+    builder
         .default_config()
         .map_err(|error| format!("The microphone has no supported format: {error}"))?
         .open_stream()
         .map_err(|error| format!("Could not open the microphone: {error}"))
 }
 
-fn record(stop: &AtomicBool, levels: &Mutex<Vec<f32>>, waker: &Waker) -> Result<Vec<f32>, String> {
-    let mut microphone = open_microphone()?;
+fn record(
+    stop: &AtomicBool,
+    levels: &Mutex<Vec<f32>>,
+    waker: &Waker,
+    microphone_name: &str,
+) -> Result<Vec<f32>, String> {
+    let mut microphone = open_microphone(microphone_name)?;
     let channels = microphone.channels().get();
     let rate = microphone.sample_rate().get();
     let chunk = (rate as usize * usize::from(channels) / 20).max(1);
@@ -740,8 +1162,8 @@ pub struct Ringtone {
 }
 
 impl Ringtone {
-    pub fn start() -> Result<Self, String> {
-        let device = open_output().map_err(|error| format!("No sound output: {error}"))?;
+    pub fn start(speaker: &str) -> Result<Self, String> {
+        let device = open_output(speaker).map_err(|error| format!("No sound output: {error}"))?;
         let sink = rodio::Player::connect_new(device.mixer());
         sink.append(SamplesBuffer::new(mono(), rate(), ring_cycle()).repeat_infinite());
         sink.play();
@@ -819,15 +1241,17 @@ pub struct CallEndpoints {
     pub sink: async_channel::Sender<Vec<i16>>,
 }
 
-/// The default microphone and speaker for the length of one call.
+/// The microphone and speaker for the length of one call.
 ///
 /// Both devices are opened by [`CallAudio::start`] and released when this is
-/// dropped; nothing holds them in between, and voice messages keep using them
-/// as before. The device threads are not the interface thread.
+/// dropped. [`CallAudio::set_devices`] points either one at another device
+/// without ending the call. The device threads are not the interface thread.
 pub struct CallAudio {
     stop: Arc<AtomicBool>,
     /// Set once the line is open. The speaker thread reads it.
     line_open: Arc<AtomicBool>,
+    microphone: Arc<Mutex<String>>,
+    speaker: Arc<Mutex<String>>,
     /// The speaker thread keeps its device until this is dropped.
     _speaker: std::sync::mpsc::Sender<()>,
 }
@@ -836,6 +1260,20 @@ impl CallAudio {
     /// The line is open: the speaker stops any ringback and plays the connect tone.
     pub fn line_open(&self) {
         self.line_open.store(true, Ordering::Relaxed);
+    }
+
+    /// Points the open call at another microphone or speaker. An empty name
+    /// follows the system default. A name that is not connected is left as it
+    /// was, and the call keeps going.
+    pub fn set_devices(&self, microphone: &str, speaker: &str) {
+        *self
+            .microphone
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = microphone.to_owned();
+        *self
+            .speaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = speaker.to_owned();
     }
 
     /// Opens the microphone and the speaker, and returns the endpoints for the
@@ -849,27 +1287,38 @@ impl CallAudio {
     ///
     /// Opening a device can take a moment, so the caller must not be the
     /// interface thread.
-    pub fn start(sink_rate: u32, ringback: bool) -> Result<(Self, CallEndpoints), String> {
+    pub fn start(
+        sink_rate: u32,
+        ringback: bool,
+        microphone: String,
+        speaker: String,
+    ) -> Result<(Self, CallEndpoints), String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, source) = async_channel::bounded(CAPTURE_QUEUE);
         let (sink, playout) = async_channel::bounded(PLAYOUT_QUEUE);
         let (opened, opening) = std::sync::mpsc::sync_channel(1);
+        let microphone_name = Arc::new(Mutex::new(microphone));
+        let speaker_name = Arc::new(Mutex::new(speaker));
         let microphone = {
             let stop = Arc::clone(&stop);
             let opened = opened.clone();
+            let microphone_name = Arc::clone(&microphone_name);
             std::thread::Builder::new()
                 .name("call-microphone".to_owned())
-                .spawn(move || capture(&stop, &frames, &opened))
+                .spawn(move || capture(&stop, &frames, &opened, &microphone_name))
                 .map_err(|error| format!("Could not start the microphone: {error}"))
         };
         // From here the guard stops the microphone on any early return.
         let audio_stop = Arc::clone(&stop);
         let line_open = Arc::new(AtomicBool::new(false));
         let speaker_open = Arc::clone(&line_open);
+        let speaker_choice = Arc::clone(&speaker_name);
         let (keep, release) = std::sync::mpsc::channel();
         let audio = Self {
             stop: audio_stop,
             line_open,
+            microphone: microphone_name,
+            speaker: speaker_name,
             _speaker: keep,
         };
         microphone?;
@@ -878,7 +1327,17 @@ impl CallAudio {
             .map_err(|_| "The microphone stopped before it opened".to_owned())??;
         std::thread::Builder::new()
             .name("call-speaker".to_owned())
-            .spawn(move || play_out(sink_rate, playout, release, &opened, ringback, speaker_open))
+            .spawn(move || {
+                play_out(
+                    sink_rate,
+                    playout,
+                    release,
+                    &opened,
+                    ringback,
+                    speaker_open,
+                    &speaker_choice,
+                )
+            })
             .map_err(|error| format!("Could not start the speaker: {error}"))?;
         opening
             .recv()
@@ -931,24 +1390,69 @@ type Opened = std::sync::mpsc::SyncSender<Result<(), String>>;
 /// Reads the microphone until told to stop, or until the device or the call
 /// goes away, and sends 960-sample 16 kHz mono frames. A frame the call has
 /// no room for is dropped, so a slow reader never holds up the device.
-fn capture(stop: &AtomicBool, frames: &async_channel::Sender<Vec<i16>>, opened: &Opened) {
-    let mut microphone = match open_microphone() {
-        Ok(microphone) => {
-            let _ = opened.send(Ok(()));
-            microphone
-        }
-        Err(error) => {
-            let _ = opened.send(Err(error));
-            return;
-        }
-    };
-    let channels = microphone.channels().get();
-    let rate = microphone.sample_rate().get();
-    // Read 20 ms at a time so a stop is noticed promptly.
-    let chunk = (rate as usize * usize::from(channels) / 50).max(1);
-    let mut stream = voice::MonoStream::new(channels, rate, WA_SAMPLE_RATE);
+fn capture(
+    stop: &AtomicBool,
+    frames: &async_channel::Sender<Vec<i16>>,
+    opened: &Opened,
+    microphone_name: &Mutex<String>,
+) {
+    let mut device = None;
+    let mut open_name = String::new();
+    let mut told = false;
+    let mut stream = None;
+    let mut chunk = 1;
     let mut framer = Framer::default();
+    // A device that refused to open. Trying it again on every pass floods the
+    // log and the sound server; wait a second, and keep the microphone that
+    // is already open.
+    let mut rejected = String::new();
+    let mut rejected_at = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        let wanted = microphone_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if device.is_none() || wanted != open_name {
+            let due = rejected != wanted || rejected_at.elapsed() >= Duration::from_secs(1);
+            if due {
+                match open_microphone(&wanted) {
+                    Ok(microphone) => {
+                        let channels = microphone.channels().get();
+                        let rate = microphone.sample_rate().get();
+                        chunk = (rate as usize * usize::from(channels) / 50).max(1);
+                        stream = Some(voice::MonoStream::new(channels, rate, WA_SAMPLE_RATE));
+                        device = Some(microphone);
+                        open_name = wanted;
+                        rejected.clear();
+                        if !told {
+                            let _ = opened.send(Ok(()));
+                            told = true;
+                        }
+                    }
+                    Err(error) => {
+                        if !told {
+                            let _ = opened.send(Err(error));
+                            return;
+                        }
+                        if rejected != wanted {
+                            log::warn!("could not switch the call's microphone: {error}");
+                            rejected = wanted.clone();
+                        }
+                        rejected_at = Instant::now();
+                        if device.is_none() {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+            }
+        }
+        let Some(microphone) = device.as_mut() else {
+            continue;
+        };
+        let Some(stream) = stream.as_mut() else {
+            continue;
+        };
+        // Read 20 ms at a time so a stop, or a new device, is noticed promptly.
         let heard: Vec<f32> = microphone.by_ref().take(chunk).collect();
         let pcm: Vec<i16> = stream.push(&heard).into_iter().map(to_pcm).collect();
         for frame in framer.push(&pcm) {
@@ -958,16 +1462,129 @@ fn capture(stop: &AtomicBool, frames: &async_channel::Sender<Vec<i16>>, opened: 
             }
         }
         if heard.len() < chunk {
-            // The device disappeared during the call. Dropping `frames`
-            // closes the source, which the library treats as a silent mic.
+            // The device disappeared. The next pass opens it again, or the
+            // default if that name is gone.
             log::warn!("The call's microphone stopped delivering audio");
-            return;
+            device = None;
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
 
+/// Samples waiting for the speaker. The producer blocks while the device is
+/// ahead, and a new device reads the same queue, so the speaker can change
+/// without ending the call.
+#[cfg(not(target_os = "linux"))]
+struct SamplePipe {
+    samples: Mutex<VecDeque<f32>>,
+    ready: Condvar,
+    done: AtomicBool,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl SamplePipe {
+    fn push(&self, sample: f32) {
+        let mut guard = self
+            .samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while guard.len() > 8_000 && !self.done.load(Ordering::Relaxed) {
+            let (next, _) = self
+                .ready
+                .wait_timeout(guard, Duration::from_millis(40))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next;
+        }
+        if self.done.load(Ordering::Relaxed) {
+            return;
+        }
+        guard.push_back(sample);
+    }
+
+    fn pop(&self) -> Option<f32> {
+        let mut guard = self
+            .samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sample = guard.pop_front();
+        if guard.len() < 4_000 {
+            self.ready.notify_one();
+        }
+        sample
+    }
+
+    fn finish(&self) {
+        self.done.store(true, Ordering::Relaxed);
+        self.ready.notify_all();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct PipeSource {
+    pipe: Arc<SamplePipe>,
+    rate: NonZero<u32>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Iterator for PipeSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if let Some(sample) = self.pipe.pop() {
+            return Some(sample);
+        }
+        if self.pipe.done.load(Ordering::Relaxed) {
+            None
+        } else {
+            Some(0.0)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Source for PipeSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> NonZero<u16> {
+        mono()
+    }
+
+    fn sample_rate(&self) -> NonZero<u32> {
+        self.rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn attach_speaker(
+    name: &str,
+    rate: u32,
+    pipe: &Arc<SamplePipe>,
+) -> Result<(rodio::MixerDeviceSink, rodio::Player), String> {
+    let device = open_output(name).map_err(|error| format!("No sound output: {error}"))?;
+    let player = rodio::Player::connect_new(device.mixer());
+    let rate = NonZero::new(rate).unwrap_or(NonZero::new(WA_SAMPLE_RATE).expect("not zero"));
+    player.append(PipeSource {
+        pipe: Arc::clone(pipe),
+        rate,
+    });
+    Ok((device, player))
+}
+
 /// Plays what the call writes to the sink until `release` is dropped.
 /// `ringback` is the local ring of a call placed here, until `line_open`.
+/// `speaker` is read throughout, so a change opens that device instead.
+///
+/// On Linux this writes the PCM itself. cpal's ALSA host refuses the whole
+/// period when PipeWire's hardware timestamp is a fraction of a millisecond
+/// behind the trigger, which is every period on this plugin, so the callback
+/// never runs and the call is silent.
+#[cfg(target_os = "linux")]
 fn play_out(
     rate: u32,
     playout: async_channel::Receiver<Vec<i16>>,
@@ -975,26 +1592,277 @@ fn play_out(
     opened: &Opened,
     ringback: bool,
     line_open: Arc<AtomicBool>,
+    speaker: &Mutex<String>,
 ) {
-    let output = open_output()
-        .map_err(|error| format!("No sound output: {error}"))
-        .map(|device| {
-            let player = rodio::Player::connect_new(device.mixer());
-            player.append(Playout::call(rate, playout, ringback, line_open));
-            (device, player)
-        });
-    // Keep the device and the player alive until the call lets go of `release`.
-    let _output = match output {
-        Ok(output) => {
-            let _ = opened.send(Ok(()));
-            output
-        }
+    let mut wanted = speaker
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut playback = match AlsaPlayback::open(&wanted, rate) {
+        Ok(playback) => playback,
         Err(error) => {
             let _ = opened.send(Err(error));
             return;
         }
     };
-    let _ = release.recv();
+    let _ = opened.send(Ok(()));
+    log::info!("call speaker: {}", speaker_label(&wanted));
+    let mut playout = Playout::call(rate, playout, ringback, line_open);
+    let mut rejected = String::new();
+    let mut rejected_at = Instant::now();
+    let mut chunk = Vec::with_capacity(480);
+    loop {
+        match release.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        let next = speaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if next != wanted && (next != rejected || rejected_at.elapsed() >= Duration::from_secs(1)) {
+            match AlsaPlayback::open(&next, rate) {
+                Ok(opened_device) => {
+                    playback = opened_device;
+                    wanted = next;
+                    rejected.clear();
+                    log::info!("call speaker: {}", speaker_label(&wanted));
+                }
+                Err(error) => {
+                    if next != rejected {
+                        log::warn!("could not switch the call's speaker: {error}");
+                        rejected = next;
+                    }
+                    rejected_at = Instant::now();
+                }
+            }
+        }
+        chunk.clear();
+        for _ in 0..480 {
+            let Some(sample) = playout.next() else {
+                return;
+            };
+            chunk.push(sample);
+        }
+        if let Err(error) = playback.write(&chunk) {
+            log::warn!("the call's speaker stopped: {error}");
+            match AlsaPlayback::open(&wanted, rate) {
+                Ok(again) => playback = again,
+                Err(error) => {
+                    log::warn!("could not reopen the call's speaker: {error}");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn speaker_label(name: &str) -> &str {
+    if name.is_empty() {
+        "system default"
+    } else {
+        name
+    }
+}
+
+/// A call's speaker, opened directly so a PipeWire timestamp cannot cancel the write.
+#[cfg(target_os = "linux")]
+struct AlsaPlayback {
+    pcm: alsa::PCM,
+    /// Device rate the resampler aims at. The PCM may have chosen another.
+    resample: voice::MonoStream,
+}
+
+#[cfg(target_os = "linux")]
+impl AlsaPlayback {
+    fn open(name: &str, source_rate: u32) -> Result<Self, String> {
+        let pcm = open_playback_pcm(name)?;
+        let device_rate = configure_playback(&pcm, source_rate)?;
+        Ok(Self {
+            pcm,
+            resample: voice::MonoStream::new(1, source_rate, device_rate),
+        })
+    }
+
+    fn write(&mut self, samples: &[f32]) -> Result<(), String> {
+        let converted = self.resample.push(samples);
+        let pcm: Vec<i16> = converted.into_iter().map(to_pcm).collect();
+        write_playback(&self.pcm, &pcm)
+    }
+}
+
+/// The named PipeWire sink, or the system default when `name` is empty or gone.
+#[cfg(target_os = "linux")]
+fn open_playback_pcm(name: &str) -> Result<alsa::PCM, String> {
+    if !name.is_empty()
+        && let Some(endpoints) = pipewire_endpoints()
+        && let Some(target) = endpoints
+            .iter()
+            .find(|endpoint| !endpoint.input && endpoint.label == name)
+            .map(|endpoint| endpoint.target.clone())
+    {
+        let opened = with_pipewire_node(Some(&target), || {
+            alsa::PCM::new("pipewire", alsa::Direction::Playback, false)
+        });
+        if let Ok(pcm) = opened {
+            return Ok(pcm);
+        }
+        log::warn!("could not open the call's speaker {name}; using the default");
+    }
+    if !name.is_empty() && pipewire_endpoints().is_none() {
+        let pcm_id = outputs().into_iter().find_map(|(shown, device)| {
+            (shown == name)
+                .then(|| describe(&device).and_then(|(_, driver)| driver))
+                .flatten()
+        });
+        if let Some(pcm_id) = pcm_id {
+            let opened = with_pipewire_node(None, || {
+                alsa::PCM::new(&pcm_id, alsa::Direction::Playback, false)
+            });
+            if let Ok(pcm) = opened {
+                return Ok(pcm);
+            }
+            log::warn!("could not open the call's speaker {name}; using the default");
+        }
+    }
+    with_pipewire_node(None, || {
+        alsa::PCM::new("default", alsa::Direction::Playback, false)
+    })
+    .map_err(|error| format!("No sound output: {error}"))
+}
+
+/// Mono 16-bit playback at the nearest rate to `source_rate`.
+#[cfg(target_os = "linux")]
+fn configure_playback(pcm: &alsa::PCM, source_rate: u32) -> Result<u32, String> {
+    // A short buffer first. Some plugins reject a requested period, and then
+    // the same device opens with whatever buffer it chooses.
+    apply_playback(pcm, source_rate, true).or_else(|_| apply_playback(pcm, source_rate, false))
+}
+
+#[cfg(target_os = "linux")]
+fn apply_playback(pcm: &alsa::PCM, source_rate: u32, short: bool) -> Result<u32, String> {
+    let params = alsa::pcm::HwParams::any(pcm).map_err(|error| error.to_string())?;
+    params
+        .set_access(alsa::pcm::Access::RWInterleaved)
+        .map_err(|error| error.to_string())?;
+    params
+        .set_format(alsa::pcm::Format::s16())
+        .map_err(|error| error.to_string())?;
+    params.set_channels(1).map_err(|error| error.to_string())?;
+    let _ = params.set_rate_resample(true);
+    let rate = params
+        .set_rate_near(source_rate, alsa::ValueOr::Nearest)
+        .map_err(|error| error.to_string())?;
+    if short {
+        // About 40 ms periods and a 120 ms buffer. The plugin's own default
+        // holds closer to a second, which is a long delay on a call.
+        let period = i64::from(rate / 25).max(1);
+        let _ = params.set_period_size_near(period, alsa::ValueOr::Nearest);
+        let _ = params.set_buffer_size_near(period.saturating_mul(3));
+    }
+    pcm.hw_params(&params).map_err(|error| error.to_string())?;
+    let software = pcm.sw_params_current().map_err(|error| error.to_string())?;
+    software
+        .set_start_threshold(1)
+        .map_err(|error| error.to_string())?;
+    pcm.sw_params(&software)
+        .map_err(|error| error.to_string())?;
+    pcm.prepare().map_err(|error| error.to_string())?;
+    Ok(rate.max(1))
+}
+
+/// Writes `samples` (mono) and recovers once from an underrun.
+#[cfg(target_os = "linux")]
+fn write_playback(pcm: &alsa::PCM, samples: &[i16]) -> Result<(), String> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let io = pcm.io_i16().map_err(|error| error.to_string())?;
+    let mut wrote = 0;
+    let mut recovered = false;
+    while wrote < samples.len() {
+        match io.writei(&samples[wrote..]) {
+            Ok(0) => return Err("The speaker accepted no audio.".to_owned()),
+            Ok(frames) => wrote += frames,
+            Err(error) if error.errno() == libc::EPIPE && !recovered => {
+                pcm.prepare().map_err(|error| error.to_string())?;
+                recovered = true;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn play_out(
+    rate: u32,
+    playout: async_channel::Receiver<Vec<i16>>,
+    release: std::sync::mpsc::Receiver<()>,
+    opened: &Opened,
+    ringback: bool,
+    line_open: Arc<AtomicBool>,
+    speaker: &Mutex<String>,
+) {
+    let pipe = Arc::new(SamplePipe {
+        samples: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+        done: AtomicBool::new(false),
+    });
+    let mut wanted = speaker
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut held = match attach_speaker(&wanted, rate, &pipe) {
+        Ok(held) => held,
+        Err(error) => {
+            let _ = opened.send(Err(error));
+            return;
+        }
+    };
+    let _ = opened.send(Ok(()));
+    let mut playout = Playout::call(rate, playout, ringback, line_open);
+    let mut rejected = String::new();
+    let mut rejected_at = Instant::now();
+    loop {
+        match release.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                pipe.finish();
+                drop(held);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        let next = speaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if next != wanted && (next != rejected || rejected_at.elapsed() >= Duration::from_secs(1)) {
+            match attach_speaker(&next, rate, &pipe) {
+                Ok(opened_device) => {
+                    held = opened_device;
+                    wanted = next;
+                    rejected.clear();
+                }
+                Err(error) => {
+                    if next != rejected {
+                        log::warn!("could not switch the call's speaker: {error}");
+                        rejected = next;
+                    }
+                    rejected_at = Instant::now();
+                }
+            }
+        }
+        for _ in 0..480 {
+            let Some(sample) = playout.next() else {
+                pipe.finish();
+                drop(held);
+                return;
+            };
+            pipe.push(sample);
+        }
+    }
 }
 
 /// Endless mono source of the frames a call delivers. It plays silence while
@@ -1007,6 +1875,13 @@ struct Playout {
     rate: NonZero<u32>,
     frames: async_channel::Receiver<Vec<i16>>,
     current: std::vec::IntoIter<i16>,
+    /// Frames taken from the call, for the log when it ends. The library
+    /// delivers one every 20 ms even when the other side has said nothing,
+    /// so a count of frames is not a count of their audio.
+    remote_frames: u64,
+    /// Frames that were not silence. The first of these is their audio
+    /// actually starting.
+    sound_frames: u64,
     /// Ringback of a call placed here. Empty once the line is open.
     ringback: Vec<f32>,
     ring_at: usize,
@@ -1047,6 +1922,8 @@ impl Playout {
             rate,
             frames,
             current: Vec::new().into_iter(),
+            remote_frames: 0,
+            sound_frames: 0,
         }
     }
 
@@ -1058,7 +1935,16 @@ impl Playout {
                 return Some(from_pcm(sample));
             }
             match self.frames.try_recv() {
-                Ok(frame) => self.current = frame.into_iter(),
+                Ok(frame) => {
+                    self.remote_frames += 1;
+                    if frame.iter().any(|sample| *sample != 0) {
+                        self.sound_frames += 1;
+                        if self.sound_frames == 1 {
+                            log::info!("call speaker: the other side's audio started");
+                        }
+                    }
+                    self.current = frame.into_iter();
+                }
                 Err(async_channel::TryRecvError::Empty) => return Some(0.0),
                 Err(async_channel::TryRecvError::Closed) => return None,
             }
@@ -1101,6 +1987,16 @@ impl Iterator for Playout {
     }
 }
 
+impl Drop for Playout {
+    fn drop(&mut self) {
+        log::info!(
+            "call speaker: {} frames with sound, {} frames in all",
+            self.sound_frames,
+            self.remote_frames
+        );
+    }
+}
+
 impl Source for Playout {
     fn current_span_len(&self) -> Option<usize> {
         None
@@ -1128,6 +2024,99 @@ pub fn recording_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipewire_lists_sinks_and_sources_and_skips_monitors() {
+        let dump = r#"[
+            {"info":{"props":{"media.class":"Audio/Sink","node.name":"alsa_output.pebble","node.description":"Pebble V3 Analog Stereo"}}},
+            {"info":{"props":{"media.class":"Audio/Sink","node.name":"alsa_output.corsair","node.description":"CORSAIR Headset Analog Stereo"}}},
+            {"info":{"props":{"media.class":"Audio/Source","node.name":"alsa_input.corsair","node.description":"CORSAIR Headset Mono"}}},
+            {"info":{"props":{"media.class":"Audio/Source","node.name":"alsa_output.corsair.monitor","node.description":"CORSAIR Headset Monitor"}}},
+            {"info":{"props":{"media.class":"Video/Source","node.name":"v4l2.kiyo","node.description":"Razer Kiyo"}}}
+        ]"#;
+        let endpoints = parse_pipewire_dump(dump);
+        let labels: Vec<(&str, bool)> = endpoints
+            .iter()
+            .map(|endpoint| (endpoint.label.as_str(), endpoint.input))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("Pebble V3 Analog Stereo", false),
+                ("CORSAIR Headset Analog Stereo", false),
+                ("CORSAIR Headset Mono", true),
+            ]
+        );
+        assert_eq!(endpoints[2].target, "alsa_input.corsair");
+    }
+
+    /// Opens the first PipeWire microphone and reads a moment of it.
+    /// `cargo test audio::tests::pipewire_microphone -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "opens a microphone on this machine"]
+    fn pipewire_microphone_delivers_samples_on_this_machine() {
+        let list = list_devices();
+        eprintln!("microphones: {:?}", list.microphones);
+        eprintln!("speakers: {:?}", list.speakers);
+        for speaker in &list.speakers {
+            open_output(speaker).unwrap_or_else(|error| panic!("speaker {speaker}: {error}"));
+        }
+        let name = list
+            .microphones
+            .first()
+            .cloned()
+            .expect("PipeWire lists a microphone");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let opened = open_microphone(&name)
+                .map(|mut microphone| microphone.by_ref().take(1_600).count());
+            let _ = tx.send(opened);
+        });
+        let opened = rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("the microphone produced nothing before the timeout");
+        let count = opened.expect("the microphone opened");
+        assert_eq!(count, 1_600, "the microphone stalled");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn alsa_lists_one_device_per_card_and_each_hdmi_output() {
+        let pcm = |id: &str, name: &str| (name.to_owned(), Some(id.to_owned()), id.to_owned());
+        let kept = choices(
+            [
+                pcm("null", "Discard all samples"),
+                pcm("pipewire", "PipeWire Sound Server"),
+                pcm("default", "Default ALSA Output"),
+                pcm("front:CARD=Generic", "Front output / input"),
+                pcm(
+                    "surround51:CARD=Generic",
+                    "HD-Audio Generic, ALC1220 Analog",
+                ),
+                pcm("hw:CARD=0,DEV=0", "HD-Audio Generic, ALC1220 Analog"),
+                pcm("front:CARD=Kiyo,DEV=0", "Razer Kiyo, USB Audio"),
+                pcm("sysdefault:CARD=Kiyo", "Razer Kiyo, USB Audio"),
+                pcm("iec958:CARD=Kiyo,DEV=0", "Razer Kiyo, USB Audio"),
+                pcm("usbstream:CARD=Kiyo", "Razer Kiyo"),
+                pcm("hdmi:CARD=HDMI,DEV=0", "HDA ATI HDMI, Dell AW3423DW"),
+                pcm("hdmi:CARD=HDMI,DEV=1", "HDA ATI HDMI, HDMI 1"),
+                pcm("hdmi:CARD=HDMI,DEV=2", "HDA ATI HDMI, HDMI 2"),
+            ]
+            .into_iter(),
+        );
+        let kept: Vec<(&str, &str)> = kept
+            .iter()
+            .map(|(name, id)| (name.as_str(), id.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("Generic, Front output / input", "front:CARD=Generic"),
+                ("Razer Kiyo, USB Audio", "sysdefault:CARD=Kiyo"),
+                ("HDA ATI HDMI, Dell AW3423DW", "hdmi:CARD=HDMI,DEV=0"),
+            ]
+        );
+    }
 
     #[test]
     fn a_clip_that_finished_is_handed_back_once() {
@@ -1435,15 +2424,27 @@ mod tests {
     #[test]
     #[ignore = "needs a microphone and a speaker"]
     fn call_audio_runs_on_this_machine() {
-        let (audio, endpoints) = CallAudio::start(16_000, false).expect("opens");
-        std::thread::sleep(Duration::from_millis(1_000));
+        let (audio, endpoints) =
+            CallAudio::start(16_000, false, String::new(), String::new()).expect("opens");
+        audio.line_open();
+        let started = Instant::now();
+        let mut written = 0;
         let mut frames = 0;
-        while let Ok(frame) = endpoints.source.try_recv() {
-            assert_eq!(frame.len(), 960);
-            frames += 1;
+        while started.elapsed() < Duration::from_millis(2_000) {
+            if endpoints.sink.try_send(vec![0; 960]).is_ok() {
+                written += 1;
+            }
+            while let Ok(frame) = endpoints.source.try_recv() {
+                assert_eq!(frame.len(), 960);
+                frames += 1;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        eprintln!("{frames} frames waiting");
-        assert!(frames > 0);
+        eprintln!("{frames} microphone frames read, {written} speaker frames taken");
+        assert!(frames > 25, "the microphone stopped delivering");
+        // 2 s of 60 ms frames is about 33; a speaker that never runs takes
+        // only what fits in the queue.
+        assert!(written > 25, "the speaker stopped taking frames");
         drop(audio);
     }
 
@@ -1528,7 +2529,7 @@ mod tests {
     #[test]
     #[ignore = "needs a microphone"]
     fn records_a_second_on_this_machine() {
-        let recorder = Recorder::start(Waker::default());
+        let recorder = Recorder::start(Waker::default(), String::new());
         std::thread::sleep(Duration::from_millis(1_000));
         assert!(recorder.failure().is_none(), "{:?}", recorder.failure());
         let levels = recorder.levels();

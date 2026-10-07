@@ -395,6 +395,139 @@ pub struct Reaction {
     pub emoji: String,
 }
 
+/// How a call in the chat ended, or that it is still going.
+///
+/// Filed under the call's own id so a later sync from the phone updates the
+/// same line.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CallRecord {
+    /// Ringing here, not answered yet.
+    Incoming,
+    /// Placed here, not answered yet.
+    Outgoing,
+    /// Connected. `since` is Unix milliseconds, as the call bar's timer.
+    Ongoing {
+        since: i64,
+    },
+    /// Answered, then ended. `seconds` is how long it lasted.
+    Answered {
+        seconds: u32,
+    },
+    Missed,
+    /// Declined here, or declined by the other person.
+    Declined,
+    /// Hung up before it was answered.
+    Cancelled,
+    /// An outgoing call nobody picked up.
+    Unanswered,
+    Failed,
+    /// Answered on another device.
+    Elsewhere,
+}
+
+impl CallRecord {
+    /// The line's title, as WhatsApp Web names the same outcome.
+    pub fn title(&self, video: bool) -> &'static str {
+        match self {
+            Self::Incoming => {
+                if video {
+                    "Incoming video call"
+                } else {
+                    "Incoming voice call"
+                }
+            }
+            Self::Outgoing => {
+                if video {
+                    "Outgoing video call"
+                } else {
+                    "Outgoing voice call"
+                }
+            }
+            Self::Ongoing { .. } => {
+                if video {
+                    "Ongoing video call"
+                } else {
+                    "Ongoing voice call"
+                }
+            }
+            Self::Answered { .. } => {
+                if video {
+                    "Video call"
+                } else {
+                    "Voice call"
+                }
+            }
+            Self::Missed => {
+                if video {
+                    "Missed video call"
+                } else {
+                    "Missed voice call"
+                }
+            }
+            Self::Declined => {
+                if video {
+                    "Declined video call"
+                } else {
+                    "Declined voice call"
+                }
+            }
+            Self::Cancelled => {
+                if video {
+                    "Cancelled video call"
+                } else {
+                    "Cancelled voice call"
+                }
+            }
+            Self::Unanswered => "No answer",
+            Self::Failed => "Call failed",
+            Self::Elsewhere => "Answered on another device",
+        }
+    }
+
+    /// The line under the title: a duration, a running timer, or a hint.
+    /// `now` is Unix seconds.
+    pub fn detail(&self, now: i64) -> String {
+        match self {
+            Self::Answered { seconds } => crate::util::duration(*seconds),
+            Self::Ongoing { since } => {
+                let seconds = (now.saturating_mul(1000).saturating_sub(*since) / 1000).max(0);
+                crate::util::duration(seconds as u32)
+            }
+            Self::Missed
+            | Self::Unanswered
+            | Self::Declined
+            | Self::Cancelled
+            | Self::Failed
+            | Self::Elsewhere => "Tap to call back".to_owned(),
+            Self::Incoming | Self::Outgoing => String::new(),
+        }
+    }
+
+    /// Still ringing or connected, so the line is not a way to place another call.
+    pub fn live(&self) -> bool {
+        matches!(self, Self::Incoming | Self::Outgoing | Self::Ongoing { .. })
+    }
+
+    /// A finished outcome. A later "still ringing" update must not replace it.
+    pub fn finished(&self) -> bool {
+        !self.live()
+    }
+}
+
+/// A call line for the archive. `protocol` is WhatsApp's call id, or a local
+/// stand-in when the call never received one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallNote {
+    pub chat: ChatId,
+    pub protocol: String,
+    pub video: bool,
+    pub outgoing: bool,
+    pub record: CallRecord,
+    /// Unix seconds the line is filed under.
+    pub started: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Content {
@@ -508,6 +641,12 @@ pub enum Content {
         /// device may not open rather than as a bare placeholder.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         once: Option<OnceMedia>,
+    },
+    /// A voice or video call, shown in the chat like WhatsApp Web: incoming,
+    /// ongoing with a timer, or how it ended.
+    Call {
+        video: bool,
+        record: CallRecord,
     },
 }
 
@@ -793,6 +932,7 @@ impl Content {
                 view_once: true, ..
             } => "View once message".to_owned(),
             Self::PhoneOnly { .. } => "Message on your phone".to_owned(),
+            Self::Call { video, record } => record.title(*video).to_owned(),
         }
     }
 
@@ -1364,6 +1504,8 @@ pub enum Scroll {
 pub enum Action {
     /// Places a voice call to a direct chat.
     StartCall(ChatId),
+    /// Places a video call to a direct chat.
+    StartVideoCall(ChatId),
     AcceptCall(CallId),
     /// Declines the call ringing here.
     RejectCall(CallId),
@@ -1373,6 +1515,13 @@ pub enum Action {
     SetCallMuted(CallId, bool),
     /// Turns our camera on or off during a video call.
     SetCallCamera(CallId, bool),
+    /// Microphone, speaker, and camera for calls. An empty name is the
+    /// system default, or the first camera.
+    SetCallDevices {
+        microphone: String,
+        speaker: String,
+        camera: String,
+    },
     Open(Page),
     /// Opens settings, or closes them when they are already showing.
     ToggleSettings,

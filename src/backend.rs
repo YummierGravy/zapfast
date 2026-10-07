@@ -617,6 +617,8 @@ pub enum Command {
     SetOnline(bool),
     /// Places a voice call to a direct chat.
     StartCall(ChatId),
+    /// Places a video call to a direct chat.
+    StartVideoCall(ChatId),
     /// Answers the call ringing here.
     AcceptCall(CallId),
     /// Declines the call ringing here.
@@ -627,6 +629,13 @@ pub enum Command {
     SetCallMuted(CallId, bool),
     /// Turns our camera on or off during a video call.
     SetCallCamera(CallId, bool),
+    /// Microphone, speaker, and camera. An empty name is the system default,
+    /// or the first camera. Applies to the next call, and to one already up.
+    SetCallDevices {
+        microphone: String,
+        speaker: String,
+        camera: String,
+    },
     Shutdown,
     /// Internal send result.
     Sent {
@@ -995,6 +1004,7 @@ pub enum Event {
         chat: ChatId,
         phase: CallPhase,
         since: i64,
+        media: CallMedia,
     },
     /// A call ended. It follows the call's `CallState` with
     /// `CallPhase::Ended`, and alone announces a call missed while ZapFast
@@ -1015,10 +1025,12 @@ pub enum Event {
         call: CallId,
         feed: crate::call_video::Feed,
     },
-    /// Whether our camera is sending in a video call.
+    /// Whether our camera is sending in a video call. `preview` is our own
+    /// picture while it is sending.
     CallCamera {
         call: CallId,
         sending: bool,
+        preview: Option<crate::call_camera::Preview>,
     },
 }
 

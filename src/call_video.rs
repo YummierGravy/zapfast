@@ -281,7 +281,7 @@ pub struct Reception {
 impl Reception {
     /// Starts the decode thread. Each picture handed over wakes the window.
     pub fn start(waker: Waker) -> std::io::Result<Self> {
-        let feed = Feed::new(waker);
+        let feed = Feed::new(waker.clone());
         let ask = Ask::default();
         let (frames, incoming) = async_channel::bounded(QUEUE);
         {
@@ -294,7 +294,7 @@ impl Reception {
         Ok(Self {
             feed,
             frames,
-            camera: std::sync::Arc::new(crate::call_camera::Sending::silent()),
+            camera: std::sync::Arc::new(crate::call_camera::Sending::silent(waker.clone())),
             ask,
         })
     }
@@ -319,10 +319,15 @@ impl Reception {
         std::sync::Arc::clone(&self.camera)
     }
 
-    /// Opens the default camera. False leaves the source silent; [`Reception::notice`]
-    /// then says why.
-    pub fn arm_camera(&self) -> bool {
-        self.camera.arm()
+    /// Opens the named camera, or the first one when `name` is empty. False
+    /// leaves the source silent; [`Reception::notice`] then says why.
+    pub fn arm_camera(&self, name: &str) -> bool {
+        self.camera.arm(name)
+    }
+
+    /// Our picture, once the camera is sending.
+    pub fn preview(&self) -> crate::call_camera::Preview {
+        self.camera.preview()
     }
 
     /// Whether pictures are being encoded for the other side.
@@ -486,7 +491,13 @@ fn run(frames: &async_channel::Receiver<VideoFrame>, feed: &Feed, ask: &Ask) {
     };
     let mut decode = Decode::default();
     let mut skipped = 0u64;
+    let mut received = 0u64;
+    let mut pictured = false;
     while let Ok(frame) = frames.recv_blocking() {
+        received += 1;
+        if received == 1 {
+            log::info!("call video: the other side's video started");
+        }
         // Still full after this one came off: units that arrived meanwhile
         // were dropped by the library.
         let full = frames.len() + 1 >= QUEUE;
@@ -497,11 +508,15 @@ fn run(frames: &async_channel::Receiver<VideoFrame>, feed: &Feed, ask: &Ask) {
             ask.ask();
         }
         if let Some(picture) = decoded.picture {
+            if !pictured {
+                pictured = true;
+                log::info!("call video: the other side's picture arrived");
+            }
             feed.put(picture);
         }
     }
-    log::debug!(
-        "call video stopped: {skipped} units skipped, {} pictures replaced unseen",
+    log::info!(
+        "call video stopped: {received} units, {skipped} skipped, {} pictures replaced unseen",
         feed.late()
     );
 }

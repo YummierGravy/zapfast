@@ -500,6 +500,8 @@ fn sections(app: &App) -> Vec<Section> {
         notifications.row(title, description, |ui, app| sound_control(ui, app, true));
     }
 
+    let calls = calls_section(app);
+
     let mut privacy = Section::new(translated(locale, "Privacy"));
     let receipts_note = if app.account_receipts_off {
         translated(locale, "Off for your account, so only groups get them.")
@@ -794,12 +796,129 @@ fn sections(app: &App) -> Vec<Section> {
         appearance,
         chats,
         notifications,
+        calls,
         privacy,
         system,
         account_section,
         files,
         about_section,
     ]
+}
+
+/// Microphone, speaker, and camera. Empty names follow the system default.
+fn calls_section(app: &App) -> Section {
+    let locale = app.locale;
+    let mut section = Section::new(translated(locale, "Calls"));
+    section.row(
+        translated(locale, "Microphone"),
+        translated(locale, "Used for calls and voice messages."),
+        |ui, app| device_setting(ui, app, DeviceKind::Microphone),
+    );
+    section.row(
+        translated(locale, "Speaker"),
+        translated(
+            locale,
+            "Used for calls, the ringtone, playback, and notification sounds.",
+        ),
+        |ui, app| device_setting(ui, app, DeviceKind::Speaker),
+    );
+    section.row(
+        translated(locale, "Camera"),
+        translated(
+            locale,
+            "Used when you place or answer a video call. Linux only.",
+        ),
+        |ui, app| device_setting(ui, app, DeviceKind::Camera),
+    );
+    section
+}
+
+enum DeviceKind {
+    Microphone,
+    Speaker,
+    Camera,
+}
+
+fn device_setting(ui: &mut egui::Ui, app: &mut App, kind: DeviceKind) {
+    app.request_devices();
+    let palette = app.palette;
+    let (current, names, salt) = match kind {
+        DeviceKind::Microphone => (
+            app.settings.microphone.clone(),
+            app.devices.microphones.clone(),
+            "settings-microphone",
+        ),
+        DeviceKind::Speaker => (
+            app.settings.speaker.clone(),
+            app.devices.speakers.clone(),
+            "settings-speaker",
+        ),
+        DeviceKind::Camera => (
+            app.settings.camera.clone(),
+            app.devices.cameras.clone(),
+            "settings-camera",
+        ),
+    };
+    let selected = if current.is_empty() {
+        crate::i18n::gettext(app.locale, "System default").into_owned()
+    } else {
+        current.clone()
+    };
+    let mut choices = vec![(
+        crate::i18n::gettext(app.locale, "System default").into_owned(),
+        String::new(),
+    )];
+    choices.extend(names.iter().cloned().map(|name| (name.clone(), name)));
+    if !current.is_empty() && !names.iter().any(|name| name == &current) {
+        choices.push((current.clone(), current.clone()));
+    }
+    // The row lays its control out right to left. A combo box there opens
+    // its list and the same click closes it. A menu of rows, in a
+    // left-to-right box, stays open until a choice is picked.
+    let width = 220.0_f32.min(ui.available_width().max(140.0));
+    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_width(width);
+        let button = ui.add_sized(
+            vec2(width, 28.0),
+            egui::Button::new(egui::RichText::new(&selected).size(13.5)),
+        );
+        theme::reveal_focus(&button);
+        button.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), &selected)
+        });
+        egui::Popup::menu(&button)
+            .id(egui::Id::new(salt))
+            .width(width.max(240.0))
+            .frame(widgets::menu_frame(&palette))
+            .show(|ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for (label, name) in choices {
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                (name == current).then_some(Icon::Check),
+                                &label,
+                            ) {
+                                let mut microphone = app.settings.microphone.clone();
+                                let mut speaker = app.settings.speaker.clone();
+                                let mut camera = app.settings.camera.clone();
+                                match kind {
+                                    DeviceKind::Microphone => microphone = name,
+                                    DeviceKind::Speaker => speaker = name,
+                                    DeviceKind::Camera => camera = name,
+                                }
+                                app.actions.push(Action::SetCallDevices {
+                                    microphone,
+                                    speaker,
+                                    camera,
+                                });
+                            }
+                        }
+                    });
+            });
+    });
 }
 
 /// The app lock: a password, how long ZapFast may go unused, and the form

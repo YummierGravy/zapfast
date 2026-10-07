@@ -263,24 +263,42 @@ Starting a reply before recording includes the quoted message.
 
 ## Calls
 
-The phone button in a one-to-one chat's header places a voice call. While it
-is being placed, ZapFast plays a ringback until the other person answers, then
-a short tone as the line opens. A call ringing here plays a ring and shows the
-caller over the window with **Accept** and **Decline**. Answering plays that
-same short tone once the line is open. A call being placed or running shows a
-bar across the top of the window with its time, **Mute**, and **Hang up**.
-A video call also has a button that turns your camera off and on.
-Calls use the default microphone and speakers.
+The phone button in a one-to-one chat's header places a voice call, and the
+video button next to it places a video call. While it is being placed, ZapFast
+plays a ringback until the other person answers, then a short tone as the line
+opens. A call ringing here plays a ring and shows the caller over the window
+with **Accept** and **Decline**. Answering plays that same short tone once the
+line is open. A call being placed or running shows a bar across the top of the
+window with its time, **Devices**, **Mute**, and **Hang up**. A video call
+also has a button that turns your camera off and on. **Devices** lists the
+microphone, speaker, and, on a video call, the camera. The same choices are
+in Settings, under Calls, and they are remembered. An empty choice follows
+the system default (the first camera, on Linux). On a PipeWire desktop the
+microphone and speaker lists are the devices PipeWire has, not every ALSA
+device.
 Group calls ring on your phone and other linked devices instead.
 
-ZapFast places voice calls. Answering a video call on Linux also sends the
-default camera. **Turn camera off** in the call bar stops that, and **Turn
-camera on** starts it again. If no camera can be opened, the other person
-sees your video as off. On Windows and macOS the camera is not sent yet.
-Their video shows in the call bar, above the chat, once its first picture
+Placing or answering a video call on Linux sends the chosen camera as a
+portrait picture, cropped from the center of the frame, so it fills a phone
+instead of arriving as a wide webcam view. Your own
+picture appears smaller, at the left of the other person's video, or on its
+own until theirs arrives. **Turn camera off** in the call bar stops that, and
+**Turn camera on** starts it again. If no camera can be opened, the other
+person sees your video as off. On Windows and macOS the camera is not sent
+yet. Their video shows in the call bar, above the chat, once its first picture
 arrives. Until then, and whenever they turn their camera off, the bar shows
-the call alone, as in a voice call. A voice call that the other person
-switches to video stays a voice call here.
+the call alone, unless your camera is on.
+
+A voice call can become a video call from either side. On Linux, **Switch to
+video** in the call bar opens your camera and asks the other person; the call
+switches when they accept, and stays a voice call if they decline or do not
+answer within a few seconds. **Cancel switching to video** withdraws the
+request. When the other person switches to video, their picture appears in
+the call bar at once and your camera stays off: **Turn camera on** sends it.
+
+A call also leaves a line in the chat: incoming, outgoing, ongoing (with the
+time so far), how long an answered call lasted, or missed, declined, cancelled,
+unanswered, or failed. A finished line can be tapped to call back.
 
 When the window is hidden or unfocused, or another number is on screen, a
 ringing call also sends a notification. Clicking it switches to the number

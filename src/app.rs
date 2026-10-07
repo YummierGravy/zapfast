@@ -312,6 +312,7 @@ pub(crate) fn can_select(content: &Content) -> bool {
             | Content::Unsupported { .. }
             | Content::Poll { .. }
             | Content::Interactive { .. }
+            | Content::Call { .. }
     )
 }
 
@@ -475,6 +476,14 @@ pub struct App {
     pub video: crate::video::Player,
     /// The other side's video in the call on screen.
     pub call_screen: crate::call_video::Screen,
+    /// Our camera's latest picture during a video call.
+    pub(crate) self_preview: Option<crate::call_camera::Preview>,
+    pub(crate) self_view: crate::call_camera::SelfView,
+    /// Devices the call menu and Settings can offer.
+    pub(crate) devices: crate::audio::DeviceList,
+    device_inbox: std::sync::Arc<std::sync::Mutex<Option<crate::audio::DeviceList>>>,
+    devices_scanning: bool,
+    devices_at: Option<Instant>,
     /// Chat of the loaded video; leaving it stops the video.
     video_chat: Option<ChatId>,
     /// Video to play once its download finishes.
@@ -897,6 +906,7 @@ impl App {
                 app.settings.keep_chats_archived,
             ));
         }
+        app.push_call_devices();
         if crate::autostart::supported() {
             app.start_with_system = Some(crate::autostart::enabled());
         }
@@ -1060,6 +1070,12 @@ impl App {
             ringtone: None,
             video: crate::video::Player::new(waker.clone()),
             call_screen: Default::default(),
+            self_preview: None,
+            self_view: Default::default(),
+            devices: Default::default(),
+            device_inbox: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            devices_scanning: false,
+            devices_at: None,
             video_chat: None,
             video_wanted: None,
             voice_chat: None,
@@ -1321,6 +1337,11 @@ impl App {
         account.backend.send(Command::SetKeepChatsArchived(
             self.settings.keep_chats_archived,
         ));
+        account.backend.send(Command::SetCallDevices {
+            microphone: self.settings.microphone.clone(),
+            speaker: self.settings.speaker.clone(),
+            camera: self.settings.camera.clone(),
+        });
         self.account_before_adding = Some(self.account().id.clone());
         self.park_composer();
         self.clear_account_ui();
@@ -2798,7 +2819,10 @@ impl App {
                 }
             }
             Event::ChatSoundPicked { chat, path } => {
-                crate::notify::play_sound(crate::settings::NotificationSound::Custom(path.clone()));
+                crate::notify::play_sound(
+                    crate::settings::NotificationSound::Custom(path.clone()),
+                    &self.settings.speaker,
+                );
                 self.actions.push(Action::SetChatSound {
                     chat,
                     sound: Some(crate::settings::NotificationSound::Custom(path)),
@@ -2823,9 +2847,10 @@ impl App {
             }
             Event::NotificationSoundPicked { mention, path } => {
                 if live {
-                    crate::notify::play_sound(crate::settings::NotificationSound::Custom(
-                        path.clone(),
-                    ));
+                    crate::notify::play_sound(
+                        crate::settings::NotificationSound::Custom(path.clone()),
+                        &self.settings.speaker,
+                    );
                     self.actions.push(Action::SetNotificationSound {
                         mention,
                         sound: crate::settings::NotificationSound::Custom(path),
@@ -2987,16 +3012,24 @@ impl App {
                 chat,
                 phase,
                 since,
-            } => self.call_state(call, chat, phase, since),
+                media,
+            } => self.call_state(call, chat, phase, since, media),
             Event::CallEnded { call, chat, reason } => self.call_ended(call, chat, reason),
             Event::CallMuted { call, muted } => {
                 if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
                     view.muted = muted;
                 }
             }
-            Event::CallCamera { call, sending } => {
-                if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
-                    view.camera = sending;
+            Event::CallCamera {
+                call,
+                sending,
+                preview,
+            } => {
+                if self.call.as_ref().is_some_and(|view| view.id == call) {
+                    if let Some(view) = self.call.as_mut() {
+                        view.camera = sending;
+                    }
+                    self.self_preview = sending.then_some(preview).flatten();
                 }
             }
             Event::CallVideo { call, feed } => {
@@ -3010,7 +3043,14 @@ impl App {
 
     /// A call moved to `phase`. One this side did not hear about is a call we
     /// placed.
-    fn call_state(&mut self, call: CallId, chat: ChatId, phase: CallPhase, since: i64) {
+    fn call_state(
+        &mut self,
+        call: CallId,
+        chat: ChatId,
+        phase: CallPhase,
+        since: i64,
+        media: CallMedia,
+    ) {
         if phase == CallPhase::Ended {
             return;
         }
@@ -3018,6 +3058,7 @@ impl App {
             Some(view) => {
                 view.phase = phase;
                 view.since = since;
+                view.media = media;
             }
             None => {
                 let name = self
@@ -3029,7 +3070,7 @@ impl App {
                     chat,
                     name,
                     incoming: false,
-                    media: CallMedia::Voice,
+                    media,
                     phase,
                     since,
                     muted: false,
@@ -3045,6 +3086,7 @@ impl App {
             return;
         };
         self.ringtone = None;
+        self.self_preview = None;
         self.clear_call_notification(call);
         // A hidden account's call says nothing over the account on screen.
         if view.incoming || self.events_hidden {
@@ -3120,13 +3162,101 @@ impl App {
         })
     }
 
+    /// Places a voice or video call when no account is already in one.
+    fn place_call(&mut self, chat: ChatId, video: bool) {
+        // One call at a time across accounts: they share the microphone,
+        // the speakers, and the camera.
+        let active = self.active;
+        let elsewhere = self
+            .accounts
+            .iter()
+            .enumerate()
+            .any(|(index, account)| index != active && account.call.is_some());
+        if elsewhere {
+            self.toast(crate::i18n::gettext(
+                self.locale,
+                "Finish the call on your other account first",
+            ));
+        } else if self.call.is_none() {
+            self.backend.send(if video {
+                Command::StartVideoCall(chat)
+            } else {
+                Command::StartCall(chat)
+            });
+        }
+    }
+
+    /// Sends the chosen call devices to every account, and to sounds that
+    /// are not part of a call.
+    fn push_call_devices(&mut self) {
+        let microphone = self.settings.microphone.clone();
+        let speaker = self.settings.speaker.clone();
+        let camera = self.settings.camera.clone();
+        self.player.set_speaker(&speaker);
+        self.video.set_speaker(&speaker);
+        self.notifications.set_speaker(&speaker);
+        if self.ringtone.is_some() {
+            self.ringtone = None;
+        }
+        for account in &self.accounts {
+            account.backend.send(Command::SetCallDevices {
+                microphone: microphone.clone(),
+                speaker: speaker.clone(),
+                camera: camera.clone(),
+            });
+        }
+    }
+
+    /// Lists microphones, speakers, and cameras off the interface thread.
+    /// A list from the last few seconds is kept.
+    pub(crate) fn request_devices(&mut self) {
+        if self.devices_scanning {
+            return;
+        }
+        if self
+            .devices_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.devices_scanning = true;
+        let inbox = std::sync::Arc::clone(&self.device_inbox);
+        let waker = self.waker.clone();
+        if std::thread::Builder::new()
+            .name("devices".into())
+            .spawn(move || {
+                *inbox
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(crate::audio::list_devices());
+                waker.wake();
+            })
+            .is_err()
+        {
+            self.devices_scanning = false;
+        }
+    }
+
+    fn take_devices(&mut self) {
+        let ready = self
+            .device_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(list) = ready {
+            self.devices = list;
+            self.devices_scanning = false;
+            self.devices_at = Some(Instant::now());
+        }
+    }
+
     /// Rings while a call waits to be answered on any account, behind the
     /// app lock too; a hidden account's ring is how its call is heard.
     fn tick_ringtone(&mut self) {
         if !self.ringing_anywhere() {
             self.ringtone = None;
         } else if self.ringtone.is_none() {
-            match crate::audio::Ringtone::start() {
+            match crate::audio::Ringtone::start(&self.settings.speaker) {
                 Ok(ring) => self.ringtone = Some(ring),
                 // Without a sound device the dialog still shows.
                 Err(error) => log::warn!("the ring could not play: {error}"),
@@ -4861,23 +4991,18 @@ impl App {
                 }
             }
             Action::ClearPending => self.pending.clear(),
-            Action::StartCall(chat) => {
-                // One call at a time across accounts: they share the
-                // microphone and the speakers.
-                let active = self.active;
-                let elsewhere = self
-                    .accounts
-                    .iter()
-                    .enumerate()
-                    .any(|(index, account)| index != active && account.call.is_some());
-                if elsewhere {
-                    self.toast(crate::i18n::gettext(
-                        self.locale,
-                        "Finish the call on your other account first",
-                    ));
-                } else if self.call.is_none() {
-                    self.backend.send(Command::StartCall(chat));
-                }
+            Action::StartCall(chat) => self.place_call(chat, false),
+            Action::StartVideoCall(chat) => self.place_call(chat, true),
+            Action::SetCallDevices {
+                microphone,
+                speaker,
+                camera,
+            } => {
+                self.settings.microphone = microphone;
+                self.settings.speaker = speaker;
+                self.settings.camera = camera;
+                self.mark_settings_dirty();
+                self.push_call_devices();
             }
             Action::AcceptCall(call) => {
                 self.ringtone = None;
@@ -4956,10 +5081,11 @@ impl App {
                     let recorder = if self.backend.is_offline() {
                         Recorder::simulated(self.waker.clone())
                     } else {
-                        Recorder::start(self.waker.clone())
+                        Recorder::start(self.waker.clone(), self.settings.microphone.clone())
                     };
                     #[cfg(not(any(test, feature = "demo")))]
-                    let recorder = Recorder::start(self.waker.clone());
+                    let recorder =
+                        Recorder::start(self.waker.clone(), self.settings.microphone.clone());
                     self.recording = Some(recorder);
                 }
             }
@@ -5780,7 +5906,9 @@ impl App {
                 self.backend
                     .send(Command::PickNotificationSound { mention });
             }
-            Action::PreviewSound(sound) => crate::notify::play_sound(sound),
+            Action::PreviewSound(sound) => {
+                crate::notify::play_sound(sound, &self.settings.speaker);
+            }
             Action::PickDownloadFolder => self.backend.send(Command::PickDownloadFolder),
             Action::SetProfile { name, about } => {
                 self.backend.send(Command::SetProfile { name, about });
@@ -6074,6 +6202,7 @@ impl App {
         self.actions.extend(crate::macos::drain(self.window_hidden));
         self.handle_control_commands();
         self.poll_custom_themes();
+        self.take_devices();
         let wallpaper = self.account().settings.wallpaper_image.clone();
         self.wallpaper_image.sync(wallpaper.as_deref(), &self.waker);
         self.handle_notification_opens();
@@ -12547,6 +12676,7 @@ mod call_tests {
                 chat: chat.clone(),
                 phase: CallPhase::Ringing,
                 since: 10,
+                media: CallMedia::Voice,
             },
             true,
         );
@@ -12559,6 +12689,7 @@ mod call_tests {
                 chat: chat.clone(),
                 phase: CallPhase::Connected,
                 since: 99,
+                media: CallMedia::Voice,
             },
             true,
         );
@@ -12579,6 +12710,7 @@ mod call_tests {
                 chat: chat.clone(),
                 phase: CallPhase::Ended,
                 since: 120,
+                media: CallMedia::Voice,
             },
             true,
         );
@@ -12651,6 +12783,7 @@ mod call_tests {
             Event::CallCamera {
                 call: CallId(4),
                 sending: true,
+                preview: None,
             },
             true,
         );
@@ -12659,6 +12792,7 @@ mod call_tests {
             Event::CallCamera {
                 call: CallId(5),
                 sending: true,
+                preview: None,
             },
             true,
         );
@@ -12667,6 +12801,7 @@ mod call_tests {
             Event::CallCamera {
                 call: CallId(5),
                 sending: false,
+                preview: None,
             },
             true,
         );

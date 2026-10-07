@@ -454,6 +454,17 @@ pub struct Settings {
     /// Pause other apps' media while recording, or while a voice message,
     /// audio, or video plays with sound.
     pub pause_other_media: bool,
+    /// Microphone for calls and voice messages. Empty follows the system default.
+    #[serde(default)]
+    pub microphone: String,
+    /// Speaker for calls, the ringtone, playback, and notification sounds.
+    /// Empty follows the system default.
+    #[serde(default)]
+    pub speaker: String,
+    /// Camera sent in a video call. Empty uses the first camera.
+    /// Only Linux opens one.
+    #[serde(default)]
+    pub camera: String,
     /// The two switches `pause_other_media` replaced, read once and folded
     /// into it by [`Settings::load`].
     #[serde(skip_serializing)]
@@ -529,6 +540,9 @@ impl Default for Settings {
             save_contacts_to_phone: true,
             voice_speed: 1.0,
             pause_other_media: true,
+            microphone: String::new(),
+            speaker: String::new(),
+            camera: String::new(),
             pause_media_while_recording: None,
             pause_media_while_playing: None,
             chat_lock_code: None,

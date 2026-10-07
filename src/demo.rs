@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use crate::app::{App, Conversation, Presence};
 use crate::backend::LinkStatus;
 use crate::model::{
-    Chat, Contact, Content, Delivery, Dialog, LinkPreview, Media, MentionRef, Message, Page,
-    Quoted, Reaction,
+    CallRecord, Chat, Contact, Content, Delivery, Dialog, LinkPreview, Media, MentionRef, Message,
+    Page, Quoted, Reaction,
 };
 use crate::settings::ThemeChoice;
 
@@ -752,6 +752,26 @@ pub fn populate(app: &mut App) {
                 view_once: true,
                 live_location: false,
                 once: Some(crate::model::OnceMedia::Photo),
+            },
+        ),
+        message(
+            ada,
+            "call:demo-missed",
+            false,
+            older + 60 * 23,
+            Content::Call {
+                video: false,
+                record: CallRecord::Missed,
+            },
+        ),
+        message(
+            ada,
+            "call:demo-answered",
+            true,
+            older + 60 * 24,
+            Content::Call {
+                video: true,
+                record: CallRecord::Answered { seconds: 91 },
             },
         ),
         message(ada, "ada-deleted", false, older + 60 * 25, Content::Revoked),

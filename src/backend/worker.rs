@@ -552,6 +552,7 @@ pub async fn run(
         link_watch: Default::default(),
         forward_queue: None,
         calls: Default::default(),
+        call_devices: Default::default(),
     };
     worker.load_state();
     worker.backfill();
@@ -873,6 +874,8 @@ struct Worker {
     forward_queue: Option<ForwardQueue<ForwardJob>>,
     /// The one call this account may have, and the library's handle to it.
     calls: calls::Calls,
+    /// Microphone, speaker, and camera for the next call and the one running.
+    call_devices: crate::audio::CallDevices,
 }
 
 /// A queued forward: where it goes, the protobuf, and its disappearing timer.
@@ -1650,7 +1653,8 @@ impl Worker {
         match bot {
             Ok(bot) => {
                 let handle = bot.spawn();
-                self.client = Some(handle.client());
+                let client = handle.client();
+                self.client = Some(client);
                 self.handle = Some(handle);
                 self.set_status(LinkStatus::Connecting);
             }
@@ -5614,7 +5618,17 @@ impl Worker {
             }
             Command::ChannelPictures(list) => self.channel_pictures_listed(list),
             Command::SetFavorite(chat, favorite) => self.set_favorite_chat(&chat, favorite),
-            Command::StartCall(chat) => self.start_call(chat),
+            Command::StartCall(chat) => self.start_call(chat, false),
+            Command::StartVideoCall(chat) => self.start_call(chat, true),
+            Command::SetCallDevices {
+                microphone,
+                speaker,
+                camera,
+            } => self.set_call_devices(crate::audio::CallDevices {
+                microphone,
+                speaker,
+                camera,
+            }),
             Command::AcceptCall(call) => self.accept_call(call),
             Command::RejectCall(call) | Command::HangUp(call) => self.hang_up_call(call),
             Command::SetCallMuted(call, muted) => self.mute_call(call, muted),
@@ -11969,6 +11983,7 @@ mod receipt_tests {
             link_watch: Default::default(),
             forward_queue: None,
             calls: Default::default(),
+            call_devices: Default::default(),
         };
         worker.archive.set_meta("me_pn", ME).unwrap();
         (worker, events_rx, inbox, wa_events)

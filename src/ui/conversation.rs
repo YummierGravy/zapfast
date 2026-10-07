@@ -13,8 +13,8 @@ use crate::animation;
 use crate::app::{App, Conversation, JumpHighlight, KeyScroll, RowHeight};
 use crate::markup;
 use crate::model::{
-    Action, Chat, ChatId, Content, Delivery, Dialog, LinkPreview, Media, MediaState, Message,
-    PickerTab, Scroll,
+    Action, CallRecord, Chat, ChatId, Content, Delivery, Dialog, LinkPreview, Media, MediaState,
+    Message, PickerTab, Scroll,
 };
 use crate::theme::{self, Icon, Palette};
 use crate::wallpaper;
@@ -356,6 +356,21 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                             .inner;
                         if call.clicked() {
                             app.actions.push(Action::StartCall(chat.id.clone()));
+                        }
+                        let video = ui
+                            .add_enabled_ui(free, |ui| {
+                                theme::icon_button(
+                                    ui,
+                                    Icon::Video,
+                                    18.0,
+                                    palette.secondary,
+                                    palette.text,
+                                    "Video call",
+                                )
+                            })
+                            .inner;
+                        if video.clicked() {
+                            app.actions.push(Action::StartVideoCall(chat.id.clone()));
                         }
                     }
                     let searching = app.chat_search_open;
@@ -1752,6 +1767,7 @@ fn estimated_height(message: &Message, width: f32, new_day: bool) -> f32 {
         Content::Document { caption, .. } => 70.0 + caption_rows(caption),
         Content::Sticker { .. } => 140.0,
         Content::Audio { .. } => 60.0,
+        Content::Call { .. } => 56.0,
         _ => 40.0,
     };
     // Bubble padding, the sender line, and the row spacing, plus the date
@@ -3179,7 +3195,9 @@ pub fn edge_scroll(pointer: f32, top: f32, bottom: f32) -> f32 {
 
 /// Starts a reply when the response was double-clicked, as the menu's "Reply".
 fn reply_on_double_click(response: &egui::Response, message: &Message, actions: &mut Vec<Action>) {
-    if response.double_clicked() && !matches!(message.content, Content::Revoked) {
+    if response.double_clicked()
+        && !matches!(message.content, Content::Revoked | Content::Call { .. })
+    {
         actions.push(Action::Reply(message.id.clone()));
     }
 }
@@ -3452,7 +3470,9 @@ fn bubble_frame(
     // and footer. Double-click on the body keeps selecting the word.
     reply_on_double_click(&bubble, message, actions);
 
-    reaction_affordance(ui, view, message, &bubble, actions);
+    if !matches!(message.content, Content::Call { .. }) {
+        reaction_affordance(ui, view, message, &bubble, actions);
+    }
     // Read right-click from input because inner widgets own their responses.
     // The whole row counts, the empty strip beside the bubble included, as in
     // other messaging apps (#240). Count only the part inside the transcript's
@@ -3492,7 +3512,10 @@ fn bubble_frame(
     .max(quick * 36.0 + 12.0);
     let keyboard_clicked =
         bubble.clicked() && bubble.has_focus() && !ui.input(|input| input.pointer.any_click());
-    let open = if right_clicked || force_menu || reacting || keyboard_clicked {
+    let call_log = matches!(message.content, Content::Call { .. });
+    let open = if call_log {
+        Some(egui::SetOpenCommand::Bool(false))
+    } else if right_clicked || force_menu || reacting || keyboard_clicked {
         Some(egui::SetOpenCommand::Bool(true))
     } else if bubble.clicked() {
         Some(egui::SetOpenCommand::Bool(false))
@@ -3849,7 +3872,12 @@ fn footer_width(ui: &egui::Ui, message: &Message) -> f32 {
     } else {
         0.0
     };
-    time + edited + not_sent + if message.from_me { 19.0 } else { 0.0 }
+    let ticks = if message.from_me && !matches!(message.content, Content::Call { .. }) {
+        19.0
+    } else {
+        0.0
+    };
+    time + edited + not_sent + ticks
 }
 
 /// Whether the message's time and ticks sit over its picture rather than
@@ -3951,7 +3979,11 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
         ui.painter()
             .layout_no_wrap(NOT_SENT.to_owned(), theme::medium(11.0), palette.text)
     });
-    let tick_width = if message.from_me { 19.0 } else { 0.0 };
+    let tick_width = if message.from_me && !matches!(message.content, Content::Call { .. }) {
+        19.0
+    } else {
+        0.0
+    };
     let width = time.size().x
         + edited.as_ref().map_or(0.0, |galley| galley.size().x + 4.0)
         + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0)
@@ -3971,7 +4003,7 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
         );
     });
     let mut x = rect.right();
-    if message.from_me {
+    if tick_width > 0.0 {
         let ticks = Rect::from_center_size(pos2(x - 7.5, rect.center().y), Vec2::splat(15.0));
         widgets::ticks(ui, palette, ticks, message.status);
         x -= tick_width;
@@ -4191,7 +4223,7 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         },
     );
     widgets::menu_separator(ui, &palette);
-    if !matches!(message.content, Content::Revoked)
+    if !matches!(message.content, Content::Revoked | Content::Call { .. })
         && widgets::menu_item(ui, &palette, Some(Icon::Reply), "Reply")
     {
         actions.push(Action::Reply(message.id.clone()));
@@ -4238,7 +4270,7 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         && matches!(message.content, Content::Text { .. })
         && age <= crate::app::EDIT_WINDOW.as_secs() as i64;
     let can_revoke = message.from_me
-        && !matches!(message.content, Content::Revoked)
+        && !matches!(message.content, Content::Revoked | Content::Call { .. })
         && age <= crate::app::REVOKE_WINDOW.as_secs() as i64;
     if can_edit && widgets::menu_item(ui, &palette, Some(Icon::Pencil), "Edit") {
         actions.push(Action::Edit(message.id.clone()));
@@ -4250,7 +4282,9 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
             for_everyone: true,
         }));
     }
-    if widgets::menu_item(ui, &palette, Some(Icon::EyeOff), "Delete for me") {
+    if !matches!(message.content, Content::Call { .. })
+        && widgets::menu_item(ui, &palette, Some(Icon::EyeOff), "Delete for me")
+    {
         actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
             chat: view.chat.id.clone(),
             message: message.id.clone(),
@@ -4933,6 +4967,65 @@ fn content(
                     );
                 },
             );
+            None
+        }
+        Content::Call { video, record } => {
+            let icon = if *video { Icon::Video } else { Icon::Phone };
+            let missed = matches!(
+                record,
+                CallRecord::Missed
+                    | CallRecord::Declined
+                    | CallRecord::Failed
+                    | CallRecord::Unanswered
+            );
+            let color = if missed {
+                palette.danger
+            } else {
+                palette.accent
+            };
+            if record.live() {
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+            let title = record.title(*video);
+            let detail = record.detail(view.now);
+            mirrored_row(
+                ui,
+                own,
+                |ui| {
+                    theme::icon(ui, icon, 18.0, color);
+                },
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        widgets::rich_text(ui, title, theme::medium(14.0), palette.text);
+                        if !detail.is_empty() {
+                            widgets::rich_text(
+                                ui,
+                                &detail,
+                                theme::regular(12.5),
+                                palette.secondary,
+                            );
+                        }
+                    });
+                },
+            );
+            let callable = record.finished()
+                && view.chat.kind == crate::model::ChatKind::Direct
+                && !view.chat.is_channel();
+            if callable {
+                let response = ui.interact(
+                    ui.min_rect(),
+                    ui.id().with(("call-back", &message.id)),
+                    Sense::click(),
+                );
+                if response.clicked() {
+                    if *video {
+                        actions.push(Action::StartVideoCall(message.chat.clone()));
+                    } else {
+                        actions.push(Action::StartCall(message.chat.clone()));
+                    }
+                }
+            }
             None
         }
         Content::PhoneOnly {

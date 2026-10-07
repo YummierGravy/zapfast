@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, vec2,
+    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, pos2,
+    vec2,
 };
 
 use crate::app::App;
@@ -157,6 +158,22 @@ pub fn incoming(app: &mut App, ctx: &egui::Context) {
         });
 }
 
+/// The call bar's camera button: its icon, its label, and whether it is lit
+/// (our camera is off in a video call). A voice call's button asks the other
+/// side to switch to video, which needs a camera to send: Linux only for now.
+fn camera_control(call: &CallView) -> Option<(Icon, &'static str, bool)> {
+    if call.phase != CallPhase::Connected {
+        return None;
+    }
+    Some(match (call.media, call.camera) {
+        (CallMedia::Voice, _) if !cfg!(target_os = "linux") => return None,
+        (CallMedia::Voice, true) => (Icon::Video, "Cancel switching to video", false),
+        (CallMedia::Voice, false) => (Icon::Video, "Switch to video", false),
+        (CallMedia::Video, true) => (Icon::Video, "Turn camera off", false),
+        (CallMedia::Video, false) => (Icon::VideoOff, "Turn camera on", true),
+    })
+}
+
 /// The size of a `picture` shown whole within `room`.
 fn fit(picture: Vec2, room: Vec2) -> Vec2 {
     if picture.x <= 0.0 || picture.y <= 0.0 {
@@ -183,6 +200,7 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
     let Some(call) = call else {
         return;
     };
+    app.request_devices();
     let palette = app.palette;
     let stage_height = (ui.ctx().content_rect().height() * 0.45).clamp(120.0, 540.0);
     if call.phase == CallPhase::Connected {
@@ -206,9 +224,8 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                 theme::icon(ui, icon, 18.0, palette.accent);
                 ui.add_space(4.0);
                 let small = BUTTON * 0.75;
-                let camera_button =
-                    call.media == CallMedia::Video && call.phase == CallPhase::Connected;
-                let buttons = if camera_button { 3.0 } else { 2.0 };
+                let camera_button = camera_control(&call);
+                let buttons = if camera_button.is_some() { 4.0 } else { 3.0 };
                 let name_width = (ui.available_width() - buttons * (small + 8.0)).max(60.0);
                 ui.allocate_ui_with_layout(
                     vec2(name_width, BUTTON * 0.75),
@@ -230,6 +247,7 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                         );
                     },
                 );
+                let mut devices_button = None;
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if round_button(
                         ui,
@@ -251,40 +269,62 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                     if round_button(ui, icon, small, fill, color, label).clicked() {
                         app.actions.push(Action::SetCallMuted(call.id, !call.muted));
                     }
-                    if camera_button {
-                        let (icon, label, fill, color) = if call.camera {
-                            (
-                                Icon::Video,
-                                "Turn camera off",
-                                palette.outline,
-                                palette.text,
-                            )
+                    if let Some((icon, label, lit)) = camera_button {
+                        let (fill, color) = if lit {
+                            (palette.text, palette.panel)
                         } else {
-                            (
-                                Icon::VideoOff,
-                                "Turn camera on",
-                                palette.text,
-                                palette.panel,
-                            )
+                            (palette.outline, palette.text)
                         };
                         if round_button(ui, icon, small, fill, color, label).clicked() {
                             app.actions
                                 .push(Action::SetCallCamera(call.id, !call.camera));
                         }
                     }
+                    devices_button = Some(round_button(
+                        ui,
+                        Icon::Settings,
+                        small,
+                        palette.outline,
+                        palette.text,
+                        "Devices",
+                    ));
                 });
+                if let Some(button) = devices_button {
+                    device_menu(app, ui, &button, call.media == CallMedia::Video);
+                }
             });
+            let mine = app
+                .self_view
+                .show(ui.ctx(), app.self_preview.as_ref().filter(|_| call.camera));
+            if call.camera {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
             let Some(picture) = &picture else {
+                if let Some(mine) = &mine {
+                    ui.add_space(6.0);
+                    let width = 180.0_f32.min(ui.available_width());
+                    let height = width * mine.size_vec2().y / mine.size_vec2().x.max(1.0);
+                    let (stage, _) =
+                        ui.allocate_exact_size(vec2(width, height.max(1.0)), Sense::hover());
+                    paint_self(ui, mine, stage);
+                    ui.add_space(4.0);
+                }
                 return None;
             };
             ui.add_space(6.0);
             let width = ui.available_width();
             let (stage, _) = ui.allocate_exact_size(vec2(width, stage_height), Sense::hover());
-            let size = fit(picture.size_vec2(), stage.size());
-            let shown = Rect::from_center_size(stage.center(), size);
-            egui::Image::new((picture.id(), size))
+            let (shown, self_rect) = split_stage(
+                stage,
+                picture.size_vec2(),
+                mine.as_ref().map(egui::TextureHandle::size_vec2),
+            );
+            egui::Image::new((picture.id(), shown.size()))
                 .corner_radius(CornerRadius::same(theme::RADIUS))
                 .paint_at(ui, shown);
+            if let (Some(mine), Some(self_rect)) = (&mine, self_rect) {
+                paint_self(ui, mine, self_rect);
+            }
             ui.add_space(4.0);
             Some(shown)
         });
@@ -297,6 +337,139 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
             None => data.remove::<Rect>(video_id()),
         }
     });
+}
+
+/// Where the other side's picture and ours go on the stage. Ours sits against
+/// the left edge, at most 180 points wide; theirs fits whole in the rest, so
+/// ours never covers them.
+fn split_stage(stage: Rect, theirs: Vec2, mine: Option<Vec2>) -> (Rect, Option<Rect>) {
+    const GAP: f32 = 8.0;
+    let Some(mine) = mine else {
+        let size = fit(theirs, stage.size());
+        return (Rect::from_center_size(stage.center(), size), None);
+    };
+    let aspect = mine.x / mine.y.max(1.0);
+    let mut height = stage.height();
+    let mut width = height * aspect;
+    let widest = (stage.width() * 0.3).min(180.0);
+    if width > widest {
+        width = widest;
+        height = width / aspect.max(0.01);
+    }
+    let own = Rect::from_min_size(
+        pos2(stage.left(), stage.center().y - height / 2.0),
+        vec2(width, height),
+    );
+    let rest = Rect::from_min_max(pos2(own.right() + GAP, stage.top()), stage.max);
+    let size = fit(theirs, rest.size());
+    (Rect::from_center_size(rest.center(), size), Some(own))
+}
+
+fn paint_self(ui: &egui::Ui, texture: &egui::TextureHandle, rect: Rect) {
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
+    egui::Image::new((texture.id(), rect.size()))
+        .corner_radius(CornerRadius::same(8))
+        .paint_at(ui, rect);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(8),
+        Stroke::new(2.0, Color32::WHITE),
+        egui::StrokeKind::Inside,
+    );
+}
+
+enum DevicePart {
+    Microphone,
+    Speaker,
+    Camera,
+}
+
+/// Microphone, speaker, and camera for the call that is up.
+///
+/// Each kind is a submenu, so a long list cannot push the others off the
+/// screen. A combo box nested here would open a second popup, and the click
+/// that shows it is an outside click on this menu, which closes it.
+fn device_menu(app: &mut App, _ui: &mut egui::Ui, button: &egui::Response, video: bool) {
+    let palette = app.palette;
+    let microphones = app.devices.microphones.clone();
+    let speakers = app.devices.speakers.clone();
+    let cameras = app.devices.cameras.clone();
+    egui::Popup::menu(button)
+        .width(280.0)
+        .frame(super::widgets::menu_frame(&palette))
+        .show(|ui| {
+            device_choices(ui, app, "Microphone", &microphones, DevicePart::Microphone);
+            device_choices(ui, app, "Speaker", &speakers, DevicePart::Speaker);
+            if video || !cameras.is_empty() {
+                device_choices(ui, app, "Camera", &cameras, DevicePart::Camera);
+            }
+        });
+}
+
+fn device_choices(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    title: &str,
+    names: &[String],
+    part: DevicePart,
+) {
+    let current = match part {
+        DevicePart::Microphone => app.settings.microphone.clone(),
+        DevicePart::Speaker => app.settings.speaker.clone(),
+        DevicePart::Camera => app.settings.camera.clone(),
+    };
+    let icon = match part {
+        DevicePart::Microphone => Icon::Mic,
+        DevicePart::Speaker => Icon::Volume2,
+        DevicePart::Camera => Icon::Video,
+    };
+    let palette = app.palette;
+    let shown = if current.is_empty() {
+        "System default"
+    } else {
+        current.as_str()
+    };
+    let label = format!("{title}: {shown}");
+    let mut choices = vec![("System default".to_owned(), String::new())];
+    choices.extend(names.iter().cloned().map(|name| (name.clone(), name)));
+    if !current.is_empty() && !names.iter().any(|name| name == &current) {
+        choices.push((current.clone(), current.clone()));
+    }
+    super::widgets::submenu(ui, &palette, icon, &label, |ui| {
+        ui.set_min_width(260.0);
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| device_rows(ui, app, choices, &current, &part));
+    });
+}
+
+fn device_rows(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    choices: Vec<(String, String)>,
+    current: &str,
+    part: &DevicePart,
+) {
+    let palette = app.palette;
+    for (label, name) in choices {
+        let icon = (name == current).then_some(Icon::Check);
+        if super::widgets::menu_item(ui, &palette, icon, &label) {
+            let mut microphone = app.settings.microphone.clone();
+            let mut speaker = app.settings.speaker.clone();
+            let mut camera = app.settings.camera.clone();
+            match part {
+                DevicePart::Microphone => microphone = name,
+                DevicePart::Speaker => speaker = name,
+                DevicePart::Camera => camera = name,
+            }
+            app.actions.push(Action::SetCallDevices {
+                microphone,
+                speaker,
+                camera,
+            });
+        }
+    }
 }
 
 /// Where the in-call bar was laid out, for layout tests.
@@ -352,5 +525,59 @@ mod tests {
         assert_eq!(status(&call, 0), "Incoming video call");
         call.media = CallMedia::Voice;
         assert_eq!(status(&call, 0), "Incoming voice call");
+    }
+
+    #[test]
+    fn a_connected_voice_call_offers_to_switch_to_video() {
+        let label = |call: &CallView| camera_control(call).map(|(_, label, _)| label);
+        let mut call = CallView {
+            id: crate::model::CallId(1),
+            chat: "1@s.whatsapp.net".into(),
+            name: "Ada".into(),
+            incoming: false,
+            media: CallMedia::Voice,
+            phase: CallPhase::Ringing,
+            since: 0,
+            muted: false,
+            camera: false,
+            video: None,
+        };
+        assert_eq!(label(&call), None, "not before the call connects");
+        call.phase = CallPhase::Connected;
+        if cfg!(target_os = "linux") {
+            assert_eq!(label(&call), Some("Switch to video"));
+            call.camera = true;
+            assert_eq!(label(&call), Some("Cancel switching to video"));
+        } else {
+            assert_eq!(label(&call), None, "no camera to send");
+        }
+        call.media = CallMedia::Video;
+        call.camera = true;
+        assert_eq!(label(&call), Some("Turn camera off"));
+        call.camera = false;
+        assert_eq!(label(&call), Some("Turn camera on"));
+    }
+
+    #[test]
+    fn our_picture_sits_left_of_theirs_without_covering_it() {
+        let stage = Rect::from_min_size(pos2(10.0, 20.0), vec2(800.0, 300.0));
+        let (theirs, mine) = split_stage(stage, vec2(480.0, 640.0), Some(vec2(240.0, 320.0)));
+        let mine = mine.expect("our picture");
+        assert_eq!(mine.left(), stage.left());
+        assert!(mine.width() <= 180.0);
+        assert!(mine.height() <= stage.height());
+        assert!(theirs.left() >= mine.right(), "{theirs:?} {mine:?}");
+        assert!(stage.contains_rect(theirs));
+
+        // A wide picture on a narrow stage still stays clear of ours.
+        let narrow = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0));
+        let (theirs, mine) = split_stage(narrow, vec2(1280.0, 720.0), Some(vec2(240.0, 320.0)));
+        let mine = mine.expect("our picture");
+        assert!(theirs.left() >= mine.right());
+        assert!(narrow.contains_rect(theirs));
+
+        let (alone, none) = split_stage(stage, vec2(480.0, 640.0), None);
+        assert!(none.is_none());
+        assert_eq!(alone.center(), stage.center());
     }
 }

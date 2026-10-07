@@ -199,6 +199,10 @@ libc = "0.2"
 # The default camera while sending video in a call. The other systems compile
 # without it and still receive video.
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-v4l", "decoding"] }
+# Call playback. cpal treats a PipeWire timestamp that is a fraction of a
+# millisecond behind the trigger as a failed write, and then writes nothing.
+# The same version cpal already uses.
+alsa = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
