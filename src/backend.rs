@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::model::{Chat, ChatId, Contact, Gif, GifError, Message, PollDraft, StickerPack};
+use crate::model::{
+    CallEndReason, CallId, CallMedia, CallPhase, Chat, ChatId, Contact, Gif, GifError, Message,
+    PollDraft, StickerPack,
+};
 use crate::paths::AccountDirs;
 
 // Re-exported so the picker can detect pasted Signal pack links.
@@ -612,6 +615,16 @@ pub enum Command {
     /// Whether the person is looking at ZapFast. While they are not, the
     /// linked phone keeps receiving push notifications.
     SetOnline(bool),
+    /// Places a voice call to a direct chat.
+    StartCall(ChatId),
+    /// Answers the call ringing here.
+    AcceptCall(CallId),
+    /// Declines the call ringing here.
+    RejectCall(CallId),
+    /// Ends a call in any phase. A call still ringing here is declined.
+    HangUp(CallId),
+    /// Mutes or unmutes the microphone in a call.
+    SetCallMuted(CallId, bool),
     Shutdown,
     /// Internal send result.
     Sent {
@@ -965,6 +978,34 @@ pub enum Event {
     GroupSaving {
         chat: ChatId,
         saving: bool,
+    },
+    /// A call is ringing here. `name` is the caller's best known name.
+    CallIncoming {
+        call: CallId,
+        chat: ChatId,
+        name: String,
+        media: CallMedia,
+    },
+    /// A call entered `phase` at `since`, in Unix milliseconds. A connected
+    /// call's timer counts from it.
+    CallState {
+        call: CallId,
+        chat: ChatId,
+        phase: CallPhase,
+        since: i64,
+    },
+    /// A call ended. It follows the call's `CallState` with
+    /// `CallPhase::Ended`, and alone announces a call missed while ZapFast
+    /// was offline, which never rang here.
+    CallEnded {
+        call: CallId,
+        chat: ChatId,
+        reason: CallEndReason,
+    },
+    /// Whether the microphone is muted in a call, after `SetCallMuted`.
+    CallMuted {
+        call: CallId,
+        muted: bool,
     },
 }
 

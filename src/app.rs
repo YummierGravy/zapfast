@@ -2945,6 +2945,11 @@ impl App {
                 self.toast_error(message);
             }
             Event::AccountRemoved => {}
+            // The call interface is not drawn yet.
+            Event::CallIncoming { .. }
+            | Event::CallState { .. }
+            | Event::CallEnded { .. }
+            | Event::CallMuted { .. } => {}
         }
         self.prune_selection();
     }

@@ -1267,6 +1267,48 @@ pub struct InviteInfo {
     pub approval: bool,
 }
 
+/// One call on one account, numbered by that account's worker. It is not
+/// WhatsApp's call id, which views never see, and like `ChatId` it is unique
+/// only inside its account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallId(pub u64);
+
+/// What a call carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallMedia {
+    Voice,
+    Video,
+}
+
+/// Where a call stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallPhase {
+    /// Ringing here, or ringing the other side.
+    Ringing,
+    /// Answered or being placed while the audio and the connection come up.
+    Connecting,
+    /// Both sides can talk.
+    Connected,
+    Ended,
+}
+
+/// Why a call ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallEndReason {
+    /// Either side hung up.
+    HungUp,
+    /// Declined, here or by the other side.
+    Rejected,
+    /// Nobody answered.
+    Missed,
+    /// Answered or declined on another of this account's devices.
+    EndedElsewhere,
+    /// The other side was in another call.
+    Busy,
+    /// The call could not be set up, or lost its connection.
+    Failed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Info,

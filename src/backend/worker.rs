@@ -36,6 +36,7 @@ use whatsapp_rust::waproto::buffa::Message as _;
 use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 
 mod bot_replies;
+mod calls;
 mod channel_pictures;
 mod contact_names;
 mod device_store;
@@ -550,6 +551,7 @@ pub async fn run(
         early: Default::default(),
         link_watch: Default::default(),
         forward_queue: None,
+        calls: Default::default(),
     };
     worker.load_state();
     worker.backfill();
@@ -586,6 +588,7 @@ pub async fn run(
                 RuntimeEvent::FavoriteChatsRead { generation, complete } => {
                     worker.favorite_chats_read(generation, complete);
                 }
+                RuntimeEvent::Call(report) => worker.call_report(report),
             },
             _ = async {
                 match deadline {
@@ -633,6 +636,8 @@ enum RuntimeEvent {
         generation: u64,
         complete: bool,
     },
+    /// A call's setup, media, or mute finished in its task.
+    Call(calls::Report),
 }
 
 /// Renames an archive whose key is gone, with its SQLite side files, and
@@ -866,6 +871,8 @@ struct Worker {
     downloads: HashSet<(ChatId, String, Option<usize>)>,
     /// Serial forward in flight. The next send waits for the running one.
     forward_queue: Option<ForwardQueue<ForwardJob>>,
+    /// The one call this account may have, and the library's handle to it.
+    calls: calls::Calls,
 }
 
 /// A queued forward: where it goes, the protobuf, and its disappearing timer.
@@ -1864,6 +1871,8 @@ impl Worker {
     }
 
     async fn stop_bot(&mut self) {
+        // A call cannot outlive the connection it was placed on.
+        self.end_call_for_stop().await;
         self.client = None;
         // A batch still going belongs to the session that was sending it, and
         // every send is its own task: one can report its tick after this
@@ -2676,6 +2685,9 @@ impl Worker {
                 self.emit(self.me_event());
             }
             E::OfflineSyncCompleted(_) => self.emit_chats(),
+            E::IncomingCall(call) => self.incoming_call(call),
+            E::MissedCall(missed) => self.missed_call(missed),
+            E::CallEndedElsewhere(ended) => self.call_ended_elsewhere(ended),
             _ => {}
         }
     }
@@ -5602,6 +5614,10 @@ impl Worker {
             }
             Command::ChannelPictures(list) => self.channel_pictures_listed(list),
             Command::SetFavorite(chat, favorite) => self.set_favorite_chat(&chat, favorite),
+            Command::StartCall(chat) => self.start_call(chat),
+            Command::AcceptCall(call) => self.accept_call(call),
+            Command::RejectCall(call) | Command::HangUp(call) => self.hang_up_call(call),
+            Command::SetCallMuted(call, muted) => self.mute_call(call, muted),
             Command::FavoritesSent {
                 through,
                 at,
@@ -11951,6 +11967,7 @@ mod receipt_tests {
             early: Default::default(),
             link_watch: Default::default(),
             forward_queue: None,
+            calls: Default::default(),
         };
         worker.archive.set_meta("me_pn", ME).unwrap();
         (worker, events_rx, inbox, wa_events)
