@@ -4,6 +4,7 @@
 .vscode/
 .claude/
 .direnv/
+.pi/
 
 /.cache/
 
