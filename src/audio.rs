@@ -1,4 +1,4 @@
-//! Audio playback and voice-message recording.
+//! Audio playback, voice-message recording, and the audio of a call.
 //!
 //! Input and output devices are opened on demand and released when idle.
 
@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use rodio::Source;
 use rodio::buffer::SamplesBuffer;
+use whatsapp_rust::async_channel::{self, TrySendError};
+use whatsapp_rust::voip::audio::{WA_FRAME_SAMPLES, WA_SAMPLE_RATE};
 
 use crate::backend::Waker;
 use crate::voice;
@@ -680,14 +682,19 @@ fn rehearse(
     Ok(samples)
 }
 
-fn record(stop: &AtomicBool, levels: &Mutex<Vec<f32>>, waker: &Waker) -> Result<Vec<f32>, String> {
-    let mut microphone = rodio::microphone::MicrophoneBuilder::new()
+/// Opens the default microphone in its own format.
+fn open_microphone() -> Result<rodio::microphone::Microphone, String> {
+    rodio::microphone::MicrophoneBuilder::new()
         .default_device()
         .map_err(|error| format!("No microphone available: {error}"))?
         .default_config()
         .map_err(|error| format!("The microphone has no supported format: {error}"))?
         .open_stream()
-        .map_err(|error| format!("Could not open the microphone: {error}"))?;
+        .map_err(|error| format!("Could not open the microphone: {error}"))
+}
+
+fn record(stop: &AtomicBool, levels: &Mutex<Vec<f32>>, waker: &Waker) -> Result<Vec<f32>, String> {
+    let mut microphone = open_microphone()?;
     let channels = microphone.channels().get();
     let rate = microphone.sample_rate().get();
     let chunk = (rate as usize * usize::from(channels) / 20).max(1);
@@ -715,6 +722,235 @@ fn record(stop: &AtomicBool, levels: &Mutex<Vec<f32>>, waker: &Waker) -> Result<
         return Err("The microphone did not record any audio".to_owned());
     }
     Ok(voice::mono_at_rate(&heard, channels, rate))
+}
+
+/// Samples in each frame the call takes from the microphone: 60 ms at 16 kHz.
+const CALL_FRAME: usize = WA_FRAME_SAMPLES;
+/// Frames the call may leave unread before the microphone drops the newest.
+const CAPTURE_QUEUE: usize = 3;
+/// Frames the call may have queued for the speaker before it drops the newest,
+/// so a stall cannot build up seconds of delay.
+const PLAYOUT_QUEUE: usize = 8;
+
+/// The ends of a call's audio that the library holds: it reads microphone
+/// frames from `source` and writes what the other side said to `sink`. Both
+/// carry mono `i16` samples, and each `source` frame has exactly 960 of them.
+pub struct CallEndpoints {
+    pub source: async_channel::Receiver<Vec<i16>>,
+    pub sink: async_channel::Sender<Vec<i16>>,
+}
+
+/// The default microphone and speaker for the length of one call.
+///
+/// Both devices are opened by [`CallAudio::start`] and released when this is
+/// dropped; nothing holds them in between, and voice messages keep using them
+/// as before. The device threads are not the interface thread.
+pub struct CallAudio {
+    stop: Arc<AtomicBool>,
+    /// The speaker thread keeps its device until this is dropped.
+    _speaker: std::sync::mpsc::Sender<()>,
+}
+
+impl CallAudio {
+    /// Opens the microphone and the speaker, and returns the endpoints for the
+    /// library. `sink_rate` is the sample rate of the frames the call writes
+    /// to the sink; the speaker converts it to the device's own.
+    ///
+    /// Opening a device can take a moment, so the caller must not be the
+    /// interface thread.
+    pub fn start(sink_rate: u32) -> Result<(Self, CallEndpoints), String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (frames, source) = async_channel::bounded(CAPTURE_QUEUE);
+        let (sink, playout) = async_channel::bounded(PLAYOUT_QUEUE);
+        let (opened, opening) = std::sync::mpsc::sync_channel(1);
+        let microphone = {
+            let stop = Arc::clone(&stop);
+            let opened = opened.clone();
+            std::thread::Builder::new()
+                .name("call-microphone".to_owned())
+                .spawn(move || capture(&stop, &frames, &opened))
+                .map_err(|error| format!("Could not start the microphone: {error}"))
+        };
+        // From here the guard stops the microphone on any early return.
+        let audio_stop = Arc::clone(&stop);
+        let (keep, release) = std::sync::mpsc::channel();
+        let audio = Self {
+            stop: audio_stop,
+            _speaker: keep,
+        };
+        microphone?;
+        opening
+            .recv()
+            .map_err(|_| "The microphone stopped before it opened".to_owned())??;
+        std::thread::Builder::new()
+            .name("call-speaker".to_owned())
+            .spawn(move || play_out(sink_rate, playout, release, &opened))
+            .map_err(|error| format!("Could not start the speaker: {error}"))?;
+        opening
+            .recv()
+            .map_err(|_| "The speaker stopped before it opened".to_owned())??;
+        Ok((audio, CallEndpoints { source, sink }))
+    }
+}
+
+impl Drop for CallAudio {
+    fn drop(&mut self) {
+        // The microphone thread notices within one chunk, and the speaker
+        // thread when `_speaker` drops after this; both release their device.
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Cuts a stream of samples into frames of [`CALL_FRAME`], carrying what is
+/// left over into the next push.
+#[derive(Default)]
+struct Framer {
+    pending: Vec<i16>,
+}
+
+impl Framer {
+    /// The whole frames that `samples` completes, in order.
+    fn push(&mut self, samples: &[i16]) -> Vec<Vec<i16>> {
+        self.pending.extend_from_slice(samples);
+        let whole = self.pending.len() / CALL_FRAME * CALL_FRAME;
+        let frames = self.pending[..whole]
+            .as_chunks::<CALL_FRAME>()
+            .0
+            .iter()
+            .map(|frame| frame.to_vec())
+            .collect();
+        self.pending.drain(..whole);
+        frames
+    }
+}
+
+fn to_pcm(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
+}
+
+fn from_pcm(sample: i16) -> f32 {
+    f32::from(sample) / 32_768.0
+}
+
+type Opened = std::sync::mpsc::SyncSender<Result<(), String>>;
+
+/// Reads the microphone until told to stop, or until the device or the call
+/// goes away, and sends 960-sample 16 kHz mono frames. A frame the call has
+/// no room for is dropped, so a slow reader never holds up the device.
+fn capture(stop: &AtomicBool, frames: &async_channel::Sender<Vec<i16>>, opened: &Opened) {
+    let mut microphone = match open_microphone() {
+        Ok(microphone) => {
+            let _ = opened.send(Ok(()));
+            microphone
+        }
+        Err(error) => {
+            let _ = opened.send(Err(error));
+            return;
+        }
+    };
+    let channels = microphone.channels().get();
+    let rate = microphone.sample_rate().get();
+    // Read 20 ms at a time so a stop is noticed promptly.
+    let chunk = (rate as usize * usize::from(channels) / 50).max(1);
+    let mut stream = voice::MonoStream::new(channels, rate, WA_SAMPLE_RATE);
+    let mut framer = Framer::default();
+    while !stop.load(Ordering::Relaxed) {
+        let heard: Vec<f32> = microphone.by_ref().take(chunk).collect();
+        let pcm: Vec<i16> = stream.push(&heard).into_iter().map(to_pcm).collect();
+        for frame in framer.push(&pcm) {
+            match frames.try_send(frame) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => return,
+            }
+        }
+        if heard.len() < chunk {
+            // The device disappeared during the call. Dropping `frames`
+            // closes the source, which the library treats as a silent mic.
+            log::warn!("The call's microphone stopped delivering audio");
+            return;
+        }
+    }
+}
+
+/// Plays what the call writes to the sink until `release` is dropped.
+fn play_out(
+    rate: u32,
+    playout: async_channel::Receiver<Vec<i16>>,
+    release: std::sync::mpsc::Receiver<()>,
+    opened: &Opened,
+) {
+    let output = open_output()
+        .map_err(|error| format!("No sound output: {error}"))
+        .map(|device| {
+            let player = rodio::Player::connect_new(device.mixer());
+            player.append(Playout::new(rate, playout));
+            (device, player)
+        });
+    // Keep the device and the player alive until the call lets go of `release`.
+    let _output = match output {
+        Ok(output) => {
+            let _ = opened.send(Ok(()));
+            output
+        }
+        Err(error) => {
+            let _ = opened.send(Err(error));
+            return;
+        }
+    };
+    let _ = release.recv();
+}
+
+/// Endless mono source of the frames a call delivers. It plays silence while
+/// none are waiting and ends only when the call closes the channel.
+struct Playout {
+    rate: NonZero<u32>,
+    frames: async_channel::Receiver<Vec<i16>>,
+    current: std::vec::IntoIter<i16>,
+}
+
+impl Playout {
+    fn new(rate: u32, frames: async_channel::Receiver<Vec<i16>>) -> Self {
+        Self {
+            rate: NonZero::new(rate).unwrap_or(NonZero::new(WA_SAMPLE_RATE).expect("not zero")),
+            frames,
+            current: Vec::new().into_iter(),
+        }
+    }
+}
+
+impl Iterator for Playout {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        loop {
+            if let Some(sample) = self.current.next() {
+                return Some(from_pcm(sample));
+            }
+            match self.frames.try_recv() {
+                Ok(frame) => self.current = frame.into_iter(),
+                Err(async_channel::TryRecvError::Empty) => return Some(0.0),
+                Err(async_channel::TryRecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
+impl Source for Playout {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> NonZero<u16> {
+        mono()
+    }
+
+    fn sample_rate(&self) -> NonZero<u32> {
+        self.rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Temporary recording path used before sending and archiving.
@@ -872,6 +1108,105 @@ mod tests {
         player.set_speed(1.0);
         assert!(player.stretching.is_none());
         assert!(cancelled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn call_endpoints_are_what_the_library_takes() {
+        fn takes<S: whatsapp_rust::voip::AudioSource, K: whatsapp_rust::voip::AudioSink>(
+            _: S,
+            _: K,
+        ) {
+        }
+        let (sink, source) = async_channel::bounded(1);
+        takes(source, sink);
+    }
+
+    #[test]
+    fn frames_are_cut_at_960_samples() {
+        let samples: Vec<i16> = (0..CALL_FRAME as i16 * 3).collect();
+        let mut framer = Framer::default();
+        let frames = framer.push(&samples);
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|frame| frame.len() == 960));
+        assert_eq!(frames.concat(), samples);
+        assert!(
+            framer.pending.is_empty(),
+            "an exact boundary leaves nothing"
+        );
+        assert!(framer.push(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_partial_frame_waits_for_the_rest() {
+        let mut framer = Framer::default();
+        assert!(framer.push(&[1; 959]).is_empty());
+        let frames = framer.push(&[2; 1]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][958], 1);
+        assert_eq!(frames[0][959], 2);
+        // A push that spans two frames leaves the remainder behind.
+        let frames = framer.push(&[3; 960 + 5]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(framer.pending, vec![3; 5]);
+    }
+
+    #[test]
+    fn no_sample_is_lost_or_repeated_whatever_the_push_sizes() {
+        let total = CALL_FRAME * 7 + 123;
+        let samples: Vec<i16> = (0..total).map(|i| (i % 30_011) as i16).collect();
+        for piece in [1usize, 7, 320, 959, 960, 961, 5_000] {
+            let mut framer = Framer::default();
+            let mut joined = Vec::new();
+            for part in samples.chunks(piece) {
+                for frame in framer.push(part) {
+                    assert_eq!(frame.len(), CALL_FRAME);
+                    joined.extend(frame);
+                }
+            }
+            joined.extend(&framer.pending);
+            assert_eq!(joined, samples, "pieces of {piece}");
+        }
+    }
+
+    #[test]
+    fn samples_convert_to_pcm_and_back() {
+        assert_eq!(to_pcm(0.0), 0);
+        assert_eq!(to_pcm(1.0), i16::MAX);
+        assert_eq!(to_pcm(-1.0), -i16::MAX);
+        assert_eq!(to_pcm(3.0), i16::MAX, "clipping stays in range");
+        assert!((from_pcm(to_pcm(0.5)) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_speaker_plays_frames_then_silence() {
+        let (sender, receiver) = async_channel::bounded(2);
+        let mut playout = Playout::new(16_000, receiver);
+        assert_eq!(playout.sample_rate().get(), 16_000);
+        assert_eq!(playout.channels().get(), 1);
+        assert_eq!(playout.next(), Some(0.0), "silence before any frame");
+        sender.try_send(vec![16_384, -16_384]).unwrap();
+        assert_eq!(playout.next(), Some(0.5));
+        assert_eq!(playout.next(), Some(-0.5));
+        assert_eq!(playout.next(), Some(0.0));
+        drop(sender);
+        assert_eq!(playout.next(), None, "ends when the call closes it");
+    }
+
+    /// Opens both devices and listens for a second:
+    /// `cargo test audio::tests::call -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a microphone and a speaker"]
+    fn call_audio_runs_on_this_machine() {
+        let (audio, endpoints) = CallAudio::start(16_000).expect("opens");
+        std::thread::sleep(Duration::from_millis(1_000));
+        let mut frames = 0;
+        while let Ok(frame) = endpoints.source.try_recv() {
+            assert_eq!(frame.len(), 960);
+            frames += 1;
+        }
+        eprintln!("{frames} frames waiting");
+        assert!(frames > 0);
+        drop(audio);
     }
 
     /// Plays a one-second test tone:

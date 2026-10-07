@@ -215,15 +215,20 @@ pub fn waveform(samples: &[f32]) -> Vec<u8> {
 
 /// Mixes interleaved channels to mono and resamples to `RATE`.
 pub fn mono_at_rate(interleaved: &[f32], channels: u16, rate: u32) -> Vec<f32> {
+    mono_resampled(interleaved, channels, rate, RATE)
+}
+
+/// Mixes interleaved channels to mono and resamples from `rate` to `target`.
+pub fn mono_resampled(interleaved: &[f32], channels: u16, rate: u32, target: u32) -> Vec<f32> {
     let channels = usize::from(channels.max(1));
     let mono: Vec<f32> = interleaved
         .chunks_exact(channels)
         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
         .collect();
-    if rate == RATE || rate == 0 || mono.is_empty() {
+    if rate == target || rate == 0 || target == 0 || mono.is_empty() {
         return mono;
     }
-    let ratio = f64::from(rate) / f64::from(RATE);
+    let ratio = f64::from(rate) / f64::from(target);
     let count = (mono.len() as f64 / ratio).floor() as usize;
     (0..count)
         .map(|index| {
@@ -235,6 +240,72 @@ pub fn mono_at_rate(interleaved: &[f32], channels: u16, rate: u32) -> Vec<f32> {
             a + (b - a) * t
         })
         .collect()
+}
+
+/// [`mono_resampled`] for a stream that arrives in pieces of any size, such
+/// as a microphone during a call. Whatever ends a piece, whether part of an
+/// interleaved frame or part of an interpolation step, is carried into the
+/// next one, so no sample is lost or repeated at the seams.
+pub struct MonoStream {
+    channels: usize,
+    /// Input samples per output sample; 1 when the rates match.
+    ratio: f64,
+    /// Interleaved samples of a frame that has not arrived whole.
+    partial: Vec<f32>,
+    /// Mono samples not yet passed over. Output position `position` counts
+    /// from its first sample, and may lie past its end after a large step.
+    tail: Vec<f32>,
+    position: f64,
+}
+
+impl MonoStream {
+    /// A stream of `channels` interleaved channels at `rate`, resampled to
+    /// `target`. A zero rate leaves the samples as they are.
+    pub fn new(channels: u16, rate: u32, target: u32) -> Self {
+        let ratio = if rate == 0 || target == 0 {
+            1.0
+        } else {
+            f64::from(rate) / f64::from(target)
+        };
+        Self {
+            channels: usize::from(channels.max(1)),
+            ratio,
+            partial: Vec::new(),
+            tail: Vec::new(),
+            position: 0.0,
+        }
+    }
+
+    /// Takes the next interleaved samples and returns the mono samples at
+    /// the target rate that they complete.
+    pub fn push(&mut self, interleaved: &[f32]) -> Vec<f32> {
+        self.partial.extend_from_slice(interleaved);
+        let whole = self.partial.len() / self.channels * self.channels;
+        let channels = self.channels as f32;
+        self.tail.extend(
+            self.partial[..whole]
+                .chunks_exact(self.channels)
+                .map(|frame| frame.iter().sum::<f32>() / channels),
+        );
+        self.partial.drain(..whole);
+        if self.ratio == 1.0 {
+            self.position = 0.0;
+            return std::mem::take(&mut self.tail);
+        }
+        let mut out = Vec::new();
+        // Interpolation needs the sample after the one the position is in.
+        while (self.position as usize) + 1 < self.tail.len() {
+            let left = self.position as usize;
+            let t = (self.position - left as f64) as f32;
+            let (a, b) = (self.tail[left], self.tail[left + 1]);
+            out.push(a + (b - a) * t);
+            self.position += self.ratio;
+        }
+        let passed = (self.position as usize).min(self.tail.len());
+        self.tail.drain(..passed);
+        self.position -= passed as f64;
+        out
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +386,73 @@ mod tests {
     fn what_is_not_opus_is_refused() {
         assert!(decode(b"not an ogg file at all").is_err());
         assert!(decode(&[]).is_err());
+    }
+
+    #[test]
+    fn call_rates_come_out_at_16k() {
+        for rate in [44_100u32, 48_000] {
+            let input = vec![0.25f32; rate as usize];
+            let out = mono_resampled(&input, 1, rate, 16_000);
+            assert!(
+                (out.len() as i64 - 16_000).abs() <= 2,
+                "{rate}: {}",
+                out.len()
+            );
+            assert!(out.iter().all(|v| (v - 0.25).abs() < 1e-6));
+        }
+        // A rate that already matches is only downmixed.
+        assert_eq!(mono_resampled(&[0.5; 8], 1, 16_000, 16_000), vec![0.5; 8]);
+    }
+
+    #[test]
+    fn a_resampled_ramp_keeps_its_slope() {
+        // 48 kHz to 16 kHz reads every third sample.
+        let ramp: Vec<f32> = (0..4_800).map(|i| i as f32).collect();
+        let out = mono_resampled(&ramp, 1, 48_000, 16_000);
+        assert_eq!(out.len(), 1_600);
+        for (index, value) in out.iter().enumerate() {
+            assert!(
+                (value - 3.0 * index as f32).abs() < 1e-3,
+                "{index}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn stereo_is_averaged_before_it_is_resampled() {
+        let stereo: Vec<f32> = (0..48_000 * 2)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -0.5 })
+            .collect();
+        let out = mono_resampled(&stereo, 2, 48_000, 16_000);
+        assert!((out.len() as i64 - 16_000).abs() <= 2, "{}", out.len());
+        assert!(out.iter().all(|v| (v - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn a_stream_in_pieces_matches_the_clip_in_one() {
+        for (channels, rate) in [(1u16, 48_000u32), (2, 44_100), (2, 48_000), (1, 16_000)] {
+            let interleaved: Vec<f32> = (0..rate as usize * usize::from(channels) / 2)
+                .map(|i| ((i * 7) % 101) as f32 / 101.0 - 0.5)
+                .collect();
+            let whole = mono_resampled(&interleaved, channels, rate, 16_000);
+            for piece in [1usize, 3, 441, 1_000, 4_096] {
+                let mut stream = MonoStream::new(channels, rate, 16_000);
+                let mut joined = Vec::new();
+                for part in interleaved.chunks(piece) {
+                    joined.extend(stream.push(part));
+                }
+                // The last sample waits for a successor that never comes.
+                let common = joined.len().min(whole.len());
+                assert!(whole.len() - common <= 2, "{rate} Hz, pieces of {piece}");
+                assert!(joined.len() <= whole.len());
+                for (index, (a, b)) in joined.iter().zip(&whole).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-4,
+                        "{channels} ch {rate} Hz, pieces of {piece}, sample {index}"
+                    );
+                }
+            }
+        }
     }
 
     /// Decodes the file in `ZAPFAST_OGG_PROBE`:
