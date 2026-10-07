@@ -29,8 +29,10 @@ RAM, compared with 1.13 GB for WhatsApp Web and its Chromium processes.
   messages.
   You can add captions to attachments before sending them.
 - **Makes voice calls.** Place and answer one-to-one voice calls, with a ring,
-  mute, and a notification that names nobody behind the app lock.
-  [How calls work](/using-zapfast/#calls).
+  a tone when the line opens, mute, and a notification that names nobody
+  behind the app lock.
+  Answer one-to-one video calls and see the other person; your camera is not
+  used yet. [How calls work](/using-zapfast/#calls).
 - **Plays media in the chat.** Voice messages, videos, round video messages,
   GIFs, and animated stickers play in place. H.264 videos in MP4 files play
   after downloading to the local cache; other formats open in your system
@@ -60,8 +62,8 @@ Feature requests can be discussed within the project's
 [product boundaries](https://github.com/crmne/zapfast/blob/main/CONTRIBUTING.md#before-opening-an-issue).
 ZapFast does not currently support:
 
-- Video calls, group calls, status posts, communities, publishing to
-  channels, and group
+- Sending video in calls (video calls are received only), group calls, status
+  posts, communities, publishing to channels, and group
   administration beyond a group's name and photo (members, admins,
   descriptions, settings).
 - Playing videos outside the supported H.264 MP4 format in the app; they open

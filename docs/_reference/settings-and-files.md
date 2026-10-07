@@ -149,8 +149,8 @@ name or description, in the interface language or in English.
   `http://host:port`, each with an optional `user:password@`; a bare
   `host:port` is an HTTP proxy. Changing it reconnects at once. Empty uses
   `ALL_PROXY` or `HTTPS_PROXY` from the environment and honors `NO_PROXY`.
-  Call audio does not use the proxy: it goes over UDP to WhatsApp's call
-  relay servers. See [Calls](/using-zapfast/#calls).
+  Call audio and video do not use the proxy: they go over UDP to WhatsApp's
+  call relay servers. See [Calls](/using-zapfast/#calls).
 - **GIPHY API key**: for GIF search, unless the build includes one. Set
   `ZAPFAST_GIPHY_KEY` at compile time to include a default key. The earlier
   `FASTSAPP_GIPHY_KEY` remains a fallback for existing builds.

@@ -1,12 +1,15 @@
-//! The voice call interface: the dialog of an incoming call and the bar of a
-//! call being placed or running.
+//! The call interface: the dialog of an incoming call, and the bar of a call
+//! being placed or running, which grows a stage for the other side's video
+//! while there is a picture to show.
 
 use std::time::Duration;
 
-use egui::{Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Sense, Stroke, vec2};
+use egui::{
+    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, vec2,
+};
 
 use crate::app::App;
-use crate::model::{Action, CallPhase, CallView};
+use crate::model::{Action, CallMedia, CallPhase, CallView};
 use crate::theme::{self, Icon};
 
 const BUTTON: f32 = 48.0;
@@ -14,6 +17,9 @@ const BUTTON: f32 = 48.0;
 /// What a call's line says: who is calling, or how far along it is.
 fn status(call: &CallView, now_ms: i64) -> String {
     match (call.phase, call.incoming) {
+        (CallPhase::Ringing, true) if call.media == CallMedia::Video => {
+            "Incoming video call".to_owned()
+        }
         (CallPhase::Ringing, true) => "Incoming voice call".to_owned(),
         (CallPhase::Ringing, false) => "Calling…".to_owned(),
         (CallPhase::Connecting, _) => "Connecting…".to_owned(),
@@ -151,16 +157,34 @@ pub fn incoming(app: &mut App, ctx: &egui::Context) {
         });
 }
 
-/// The bar above the window while a call is being placed or runs.
+/// The size of a `picture` shown whole within `room`.
+fn fit(picture: Vec2, room: Vec2) -> Vec2 {
+    if picture.x <= 0.0 || picture.y <= 0.0 {
+        return Vec2::ZERO;
+    }
+    picture * (room.x / picture.x).min(room.y / picture.y)
+}
+
+/// The bar above the window while a call is being placed or runs. Once the
+/// other side's video has a picture, the bar shows it below its controls;
+/// until then, and in a voice call, it is the bar alone.
 pub fn bar(app: &mut App, ui: &mut egui::Ui) {
-    let Some(call) = app
+    let call = app
         .call
         .clone()
-        .filter(|call| !(call.incoming && call.phase == CallPhase::Ringing))
-    else {
+        .filter(|call| !(call.incoming && call.phase == CallPhase::Ringing));
+    // Called without a call too, so the last call's texture goes.
+    let picture = app.call_screen.show(
+        ui.ctx(),
+        call.as_ref()
+            .filter(|call| call.phase != CallPhase::Ended)
+            .and_then(|call| call.video.as_ref()),
+    );
+    let Some(call) = call else {
         return;
     };
     let palette = app.palette;
+    let stage_height = (ui.ctx().content_rect().height() * 0.45).clamp(120.0, 540.0);
     if call.phase == CallPhase::Connected {
         // The timer counts without any event to redraw it.
         ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -175,7 +199,11 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(BUTTON * 0.75);
-                theme::icon(ui, Icon::Phone, 18.0, palette.accent);
+                let icon = match call.media {
+                    CallMedia::Video => Icon::Video,
+                    CallMedia::Voice => Icon::Phone,
+                };
+                theme::icon(ui, icon, 18.0, palette.accent);
                 ui.add_space(4.0);
                 let name_width = (ui.available_width() - 2.0 * (BUTTON * 0.75 + 8.0)).max(60.0);
                 ui.allocate_ui_with_layout(
@@ -222,14 +250,39 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             });
+            let Some(picture) = &picture else {
+                return None;
+            };
+            ui.add_space(6.0);
+            let width = ui.available_width();
+            let (stage, _) = ui.allocate_exact_size(vec2(width, stage_height), Sense::hover());
+            let size = fit(picture.size_vec2(), stage.size());
+            let shown = Rect::from_center_size(stage.center(), size);
+            egui::Image::new((picture.id(), size))
+                .corner_radius(CornerRadius::same(theme::RADIUS))
+                .paint_at(ui, shown);
+            ui.add_space(4.0);
+            Some(shown)
         });
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(bar_id(), shown.response.rect));
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(bar_id(), shown.response.rect);
+        match shown.inner {
+            Some(stage) => {
+                data.insert_temp(video_id(), stage);
+            }
+            None => data.remove::<Rect>(video_id()),
+        }
+    });
 }
 
 /// Where the in-call bar was laid out, for layout tests.
 pub(crate) fn bar_id() -> egui::Id {
     egui::Id::new("call-bar-rect")
+}
+
+/// Where the other side's video was drawn, for layout tests.
+pub(crate) fn video_id() -> egui::Id {
+    egui::Id::new("call-video-rect")
 }
 
 #[cfg(test)]
@@ -243,5 +296,36 @@ mod tests {
         assert_eq!(timer(0, 3_723_000), "1:02:03");
         // A clock that stepped back does not show a negative time.
         assert_eq!(timer(5_000, 1_000), "0:00");
+    }
+
+    #[test]
+    fn the_picture_fits_its_stage_whole() {
+        assert_eq!(
+            fit(vec2(1280.0, 720.0), vec2(640.0, 540.0)),
+            vec2(640.0, 360.0)
+        );
+        assert_eq!(
+            fit(vec2(720.0, 1280.0), vec2(800.0, 320.0)),
+            vec2(180.0, 320.0)
+        );
+        assert_eq!(fit(vec2(0.0, 0.0), vec2(800.0, 320.0)), Vec2::ZERO);
+    }
+
+    #[test]
+    fn a_ringing_video_call_says_so() {
+        let mut call = CallView {
+            id: crate::model::CallId(1),
+            chat: "1@s.whatsapp.net".into(),
+            name: "Ada".into(),
+            incoming: true,
+            media: CallMedia::Video,
+            phase: CallPhase::Ringing,
+            since: 0,
+            muted: false,
+            video: None,
+        };
+        assert_eq!(status(&call, 0), "Incoming video call");
+        call.media = CallMedia::Voice;
+        assert_eq!(status(&call, 0), "Incoming voice call");
     }
 }

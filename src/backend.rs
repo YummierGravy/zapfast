@@ -1007,6 +1007,12 @@ pub enum Event {
         call: CallId,
         muted: bool,
     },
+    /// A video call is being answered: the other side's pictures arrive in
+    /// `feed`. Video is received only; nothing is sent.
+    CallVideo {
+        call: CallId,
+        feed: crate::call_video::Feed,
+    },
 }
 
 /// A change to a group's info, as sent to WhatsApp.

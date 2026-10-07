@@ -758,26 +758,56 @@ impl Drop for Ringtone {
     }
 }
 
-/// Two short double tones and a pause, the cadence of a phone ringing.
+fn samples_for(rate: f32, seconds: f32) -> usize {
+    (seconds * rate) as usize
+}
+
+/// A faded tone at `hz`, quiet enough to sit under a voice. The fade keeps
+/// the ends from clicking.
+fn burst(rate: f32, hz: &[f32], seconds: f32) -> impl Iterator<Item = f32> {
+    let length = samples_for(rate, seconds).max(1);
+    let fade = samples_for(rate, 0.02).max(1);
+    (0..length).map(move |n| {
+        let t = n as f32 / rate;
+        let wave = hz
+            .iter()
+            .map(|hz| (std::f32::consts::TAU * hz * t).sin())
+            .sum::<f32>();
+        let edge = n.min(length - 1 - n).min(fade) as f32 / fade as f32;
+        // One note or several share the same peak.
+        wave / hz.len() as f32 * 0.25 * edge
+    })
+}
+
+fn quiet(rate: f32, seconds: f32) -> impl Iterator<Item = f32> {
+    std::iter::repeat_n(0.0, samples_for(rate, seconds))
+}
+
+/// Two short double tones and a pause, the cadence of a phone ringing here.
 fn ring_cycle() -> Vec<f32> {
     let rate = voice::RATE as f32;
-    let tone = |seconds: f32| {
-        let length = (seconds * rate) as usize;
-        let fade = (0.02 * rate) as usize;
-        (0..length).map(move |n| {
-            let t = n as f32 / rate;
-            let wave = (std::f32::consts::TAU * 440.0 * t).sin()
-                + (std::f32::consts::TAU * 480.0 * t).sin();
-            // Ramps at both ends keep the tone from clicking.
-            let edge = n.min(length - 1 - n).min(fade) as f32 / fade as f32;
-            wave * 0.5 * 0.25 * edge
-        })
-    };
-    let silence = |seconds: f32| std::iter::repeat_n(0.0, (seconds * rate) as usize);
+    let tone = |seconds: f32| burst(rate, &[440.0, 480.0], seconds);
     tone(0.4)
-        .chain(silence(0.2))
+        .chain(quiet(rate, 0.2))
         .chain(tone(0.4))
-        .chain(silence(2.0))
+        .chain(quiet(rate, 2.0))
+        .collect()
+}
+
+/// One longer tone and a pause: the ringback of a call placed here, at `rate`.
+fn ringback_cycle(rate: u32) -> Vec<f32> {
+    let rate = rate as f32;
+    burst(rate, &[440.0, 480.0], 1.0)
+        .chain(quiet(rate, 2.0))
+        .collect()
+}
+
+/// Two short rising notes, the sound of a line opening, at `rate`.
+fn connect_tone(rate: u32) -> Vec<f32> {
+    let rate = rate as f32;
+    burst(rate, &[660.0], 0.09)
+        .chain(quiet(rate, 0.04))
+        .chain(burst(rate, &[880.0], 0.16))
         .collect()
 }
 
@@ -796,18 +826,30 @@ pub struct CallEndpoints {
 /// as before. The device threads are not the interface thread.
 pub struct CallAudio {
     stop: Arc<AtomicBool>,
+    /// Set once the line is open. The speaker thread reads it.
+    line_open: Arc<AtomicBool>,
     /// The speaker thread keeps its device until this is dropped.
     _speaker: std::sync::mpsc::Sender<()>,
 }
 
 impl CallAudio {
+    /// The line is open: the speaker stops any ringback and plays the connect tone.
+    pub fn line_open(&self) {
+        self.line_open.store(true, Ordering::Relaxed);
+    }
+
     /// Opens the microphone and the speaker, and returns the endpoints for the
     /// library. `sink_rate` is the sample rate of the frames the call writes
     /// to the sink; the speaker converts it to the device's own.
     ///
+    /// `ringback` plays a local ring until [`CallAudio::line_open`]: a call
+    /// placed here has not been answered yet. A call answered here passes
+    /// `false` and plays the other side until the line is open, then the
+    /// connect tone.
+    ///
     /// Opening a device can take a moment, so the caller must not be the
     /// interface thread.
-    pub fn start(sink_rate: u32) -> Result<(Self, CallEndpoints), String> {
+    pub fn start(sink_rate: u32, ringback: bool) -> Result<(Self, CallEndpoints), String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (frames, source) = async_channel::bounded(CAPTURE_QUEUE);
         let (sink, playout) = async_channel::bounded(PLAYOUT_QUEUE);
@@ -822,9 +864,12 @@ impl CallAudio {
         };
         // From here the guard stops the microphone on any early return.
         let audio_stop = Arc::clone(&stop);
+        let line_open = Arc::new(AtomicBool::new(false));
+        let speaker_open = Arc::clone(&line_open);
         let (keep, release) = std::sync::mpsc::channel();
         let audio = Self {
             stop: audio_stop,
+            line_open,
             _speaker: keep,
         };
         microphone?;
@@ -833,7 +878,7 @@ impl CallAudio {
             .map_err(|_| "The microphone stopped before it opened".to_owned())??;
         std::thread::Builder::new()
             .name("call-speaker".to_owned())
-            .spawn(move || play_out(sink_rate, playout, release, &opened))
+            .spawn(move || play_out(sink_rate, playout, release, &opened, ringback, speaker_open))
             .map_err(|error| format!("Could not start the speaker: {error}"))?;
         opening
             .recv()
@@ -922,17 +967,20 @@ fn capture(stop: &AtomicBool, frames: &async_channel::Sender<Vec<i16>>, opened: 
 }
 
 /// Plays what the call writes to the sink until `release` is dropped.
+/// `ringback` is the local ring of a call placed here, until `line_open`.
 fn play_out(
     rate: u32,
     playout: async_channel::Receiver<Vec<i16>>,
     release: std::sync::mpsc::Receiver<()>,
     opened: &Opened,
+    ringback: bool,
+    line_open: Arc<AtomicBool>,
 ) {
     let output = open_output()
         .map_err(|error| format!("No sound output: {error}"))
         .map(|device| {
             let player = rodio::Player::connect_new(device.mixer());
-            player.append(Playout::new(rate, playout));
+            player.append(Playout::call(rate, playout, ringback, line_open));
             (device, player)
         });
     // Keep the device and the player alive until the call lets go of `release`.
@@ -951,26 +999,60 @@ fn play_out(
 
 /// Endless mono source of the frames a call delivers. It plays silence while
 /// none are waiting and ends only when the call closes the channel.
+///
+/// A call placed here plays ringback instead of those frames until the line
+/// opens, then a short connect tone mixed with them. A call answered here
+/// plays the frames at once, and the same tone once the line opens.
 struct Playout {
     rate: NonZero<u32>,
     frames: async_channel::Receiver<Vec<i16>>,
     current: std::vec::IntoIter<i16>,
+    /// Ringback of a call placed here. Empty once the line is open.
+    ringback: Vec<f32>,
+    ring_at: usize,
+    open: Arc<AtomicBool>,
+    connect: std::vec::IntoIter<f32>,
+    /// The connect tone has been queued. A plain playout sets this so it
+    /// never plays one.
+    connect_started: bool,
 }
 
 impl Playout {
+    /// The other side only, with no local tone. Tests of the frame path use this.
+    #[cfg(test)]
     fn new(rate: u32, frames: async_channel::Receiver<Vec<i16>>) -> Self {
+        let mut playout = Self::call(rate, frames, false, Arc::new(AtomicBool::new(true)));
+        playout.connect_started = true;
+        playout
+    }
+
+    /// A call's speaker. `ringback` holds the local ring until `open` is set.
+    fn call(
+        rate: u32,
+        frames: async_channel::Receiver<Vec<i16>>,
+        ringback: bool,
+        open: Arc<AtomicBool>,
+    ) -> Self {
+        let rate = NonZero::new(rate).unwrap_or(NonZero::new(WA_SAMPLE_RATE).expect("not zero"));
         Self {
-            rate: NonZero::new(rate).unwrap_or(NonZero::new(WA_SAMPLE_RATE).expect("not zero")),
+            ringback: if ringback {
+                ringback_cycle(rate.get())
+            } else {
+                Vec::new()
+            },
+            ring_at: 0,
+            open,
+            connect: Vec::new().into_iter(),
+            connect_started: false,
+            rate,
             frames,
             current: Vec::new().into_iter(),
         }
     }
-}
 
-impl Iterator for Playout {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
+    /// The next sample from the other side: silence when none is waiting,
+    /// `None` when the call has closed the channel.
+    fn remote(&mut self) -> Option<f32> {
         loop {
             if let Some(sample) = self.current.next() {
                 return Some(from_pcm(sample));
@@ -981,6 +1063,41 @@ impl Iterator for Playout {
                 Err(async_channel::TryRecvError::Closed) => return None,
             }
         }
+    }
+
+    /// Drops one waiting frame so a ringback cannot fill the queue. `false`
+    /// once the call has closed the channel.
+    fn discard_remote(&mut self) -> bool {
+        self.current = Vec::new().into_iter();
+        match self.frames.try_recv() {
+            Ok(_) | Err(async_channel::TryRecvError::Empty) => true,
+            Err(async_channel::TryRecvError::Closed) => false,
+        }
+    }
+}
+
+impl Iterator for Playout {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        let open = self.open.load(Ordering::Relaxed);
+        if !self.ringback.is_empty() && !open {
+            if !self.discard_remote() {
+                return None;
+            }
+            let sample = self.ringback[self.ring_at];
+            self.ring_at = (self.ring_at + 1) % self.ringback.len();
+            return Some(sample);
+        }
+        if open && !self.connect_started {
+            self.connect_started = true;
+            self.connect = connect_tone(self.rate.get()).into_iter();
+        }
+        if let Some(tone) = self.connect.next() {
+            let remote = self.remote()?;
+            return Some((remote + tone).clamp(-1.0, 1.0));
+        }
+        self.remote()
     }
 }
 
@@ -1034,6 +1151,69 @@ mod tests {
         assert!(cycle.iter().all(|sample| sample.abs() <= 0.25));
         assert!(cycle.iter().any(|sample| sample.abs() > 0.1));
         assert_eq!(cycle[0], 0.0);
+    }
+
+    #[test]
+    fn the_ringback_and_the_connect_tone_are_quiet() {
+        let ringback = ringback_cycle(16_000);
+        let tone = connect_tone(16_000);
+        assert_eq!(ringback.len(), 16_000 * 3);
+        assert!(tone.len() < 16_000, "the connect tone is under a second");
+        for cycle in [&ringback, &tone] {
+            assert!(cycle.iter().all(|sample| sample.abs() <= 0.25));
+            assert!(cycle.iter().any(|sample| sample.abs() > 0.1));
+            assert_eq!(cycle[0], 0.0);
+        }
+        assert_ne!(
+            ringback, tone,
+            "a line opening does not sound like the ringback"
+        );
+    }
+
+    #[test]
+    fn an_outgoing_call_rings_until_the_line_opens() {
+        let (sender, receiver) = async_channel::bounded(4);
+        let open = Arc::new(AtomicBool::new(false));
+        let mut playout = Playout::call(16_000, receiver, true, Arc::clone(&open));
+        sender.try_send(vec![16_384; 8]).unwrap();
+        assert_eq!(playout.next(), Some(0.0), "the ringback fades in");
+        assert!(sender.is_empty(), "remote audio waits out the ringback");
+        let mut heard = false;
+        for _ in 0..16_000 {
+            let sample = playout.next().unwrap();
+            assert!(sample.abs() <= 0.25);
+            heard |= sample.abs() > 0.1;
+        }
+        assert!(heard, "the ringback is audible");
+
+        open.store(true, Ordering::Relaxed);
+        let tone_len = connect_tone(16_000).len();
+        let mut peak = 0.0f32;
+        for _ in 0..tone_len {
+            let sample = playout.next().unwrap();
+            peak = peak.max(sample.abs());
+            assert!(sample.abs() <= 1.0);
+        }
+        assert!(peak > 0.1, "the connect tone plays as the line opens");
+        assert_eq!(playout.next(), Some(0.0), "silence until the other side");
+        sender.try_send(vec![16_384]).unwrap();
+        assert!((playout.next().unwrap() - 0.5).abs() < 0.02);
+    }
+
+    #[test]
+    fn an_answered_call_plays_the_other_side_then_the_connect_tone() {
+        let (sender, receiver) = async_channel::bounded(4);
+        let open = Arc::new(AtomicBool::new(false));
+        let mut playout = Playout::call(16_000, receiver, false, Arc::clone(&open));
+        sender.try_send(vec![16_384]).unwrap();
+        assert!((playout.next().unwrap() - 0.5).abs() < 0.02);
+        open.store(true, Ordering::Relaxed);
+        let mut peak = 0.0f32;
+        for _ in 0..connect_tone(16_000).len() {
+            peak = peak.max(playout.next().unwrap().abs());
+        }
+        assert!(peak > 0.1);
+        assert_eq!(playout.next(), Some(0.0));
     }
 
     #[test]
@@ -1255,7 +1435,7 @@ mod tests {
     #[test]
     #[ignore = "needs a microphone and a speaker"]
     fn call_audio_runs_on_this_machine() {
-        let (audio, endpoints) = CallAudio::start(16_000).expect("opens");
+        let (audio, endpoints) = CallAudio::start(16_000, false).expect("opens");
         std::thread::sleep(Duration::from_millis(1_000));
         let mut frames = 0;
         while let Ok(frame) = endpoints.source.try_recv() {

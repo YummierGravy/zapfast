@@ -816,7 +816,7 @@ fn quarter_turns(a: i32, b: i32, c: i32, d: i32) -> u8 {
 }
 
 /// Size that fits `width` by `height` within `max_side` on its longest side.
-fn fitted(width: u32, height: u32, max_side: u32) -> (u32, u32) {
+pub(crate) fn fitted(width: u32, height: u32, max_side: u32) -> (u32, u32) {
     let longest = width.max(height);
     if longest <= max_side || longest == 0 {
         return (width, height);
@@ -990,12 +990,12 @@ fn picture(yuv: &openh264::decoder::DecodedYUV<'_>, turns: u8, side: u32) -> Opt
 }
 
 /// A YUV 4:2:0 picture as the decoder leaves it.
-struct Planes<'a> {
-    y: &'a [u8],
-    u: &'a [u8],
-    v: &'a [u8],
-    strides: (usize, usize, usize),
-    size: (usize, usize),
+pub(crate) struct Planes<'a> {
+    pub(crate) y: &'a [u8],
+    pub(crate) u: &'a [u8],
+    pub(crate) v: &'a [u8],
+    pub(crate) strides: (usize, usize, usize),
+    pub(crate) size: (usize, usize),
 }
 
 /// Converts limited-range BT.601 YUV to RGB at `out` size, turned clockwise
@@ -1003,7 +1003,7 @@ struct Planes<'a> {
 /// sample per output pixel, so a large video costs about as much as a small
 /// one; when scaling, luma is averaged over the first two by two source
 /// pixels each output pixel covers, which keeps downscaled edges smooth.
-fn convert(planes: &Planes<'_>, out: (usize, usize), turns: u8) -> ColorImage {
+pub(crate) fn convert(planes: &Planes<'_>, out: (usize, usize), turns: u8) -> ColorImage {
     let (width, height) = planes.size;
     let (out_width, out_height) = out;
     let turned = if turns % 2 == 1 {

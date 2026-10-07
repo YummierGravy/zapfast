@@ -1318,10 +1318,14 @@ pub struct CallView {
     pub name: String,
     /// Whether the other side placed it.
     pub incoming: bool,
+    /// What the call was placed as.
+    pub media: CallMedia,
     pub phase: CallPhase,
     /// When the call entered `phase`, in Unix milliseconds.
     pub since: i64,
     pub muted: bool,
+    /// The other side's video, once a video call is answered.
+    pub video: Option<crate::call_video::Feed>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

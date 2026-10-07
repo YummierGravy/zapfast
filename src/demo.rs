@@ -2158,13 +2158,21 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     message.status = crate::model::Delivery::Failed;
                 }
             }
-            "call-incoming" | "call-active" => {
-                use crate::model::{CallId, CallPhase, CallView};
+            "call-incoming" | "call-active" | "call-video" => {
+                use crate::call_video::{Feed, Picture};
+                use crate::model::{CallId, CallMedia, CallPhase, CallView};
                 let chat = app
                     .open_chat
                     .clone()
                     .unwrap_or_else(|| SAMPLES[0].id.to_owned());
                 let incoming = part == "call-incoming";
+                // A connected video call showing a synthetic picture, as
+                // the decode thread would hand it over.
+                let video = (part == "call-video").then(|| {
+                    let feed = Feed::new(crate::backend::Waker::default());
+                    feed.put(Picture::pattern(640, 360));
+                    feed
+                });
                 app.call = Some(CallView {
                     id: CallId(1),
                     name: app
@@ -2172,6 +2180,11 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         .map_or_else(String::new, |chat| app.chat_title(chat)),
                     chat,
                     incoming,
+                    media: if video.is_some() {
+                        CallMedia::Video
+                    } else {
+                        CallMedia::Voice
+                    },
                     phase: if incoming {
                         CallPhase::Ringing
                     } else {
@@ -2179,6 +2192,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     },
                     since: crate::util::now() * 1000 - 83_000,
                     muted: false,
+                    video,
                 });
             }
             "info" => {
@@ -4299,6 +4313,7 @@ mod tests {
             "group-info-saving",
             "call-incoming",
             "call-active",
+            "call-video",
             "forward",
             "unlink",
             "leave-group",
@@ -4616,6 +4631,45 @@ mod tests {
         render(&mut app, &ctx);
         assert!(area(&ctx, "incoming-call").is_none());
         assert!(bar(&ctx).is_some_and(|rect| rect.height() > 0.0));
+        let video = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::call::video_id()))
+        };
+        assert!(video(&ctx).is_none(), "a voice call keeps the bar alone");
+    }
+
+    /// A video call with a picture shows it below the bar's controls, inside
+    /// the bar, upright and whole; without one it is the bar alone.
+    #[test]
+    fn a_video_call_shows_the_other_sides_picture() {
+        let video = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::call::video_id()))
+        };
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("call-video"));
+        render(&mut app, &ctx);
+        let bar = ctx
+            .data(|data| data.get_temp::<egui::Rect>(crate::ui::call::bar_id()))
+            .expect("the bar");
+        let stage = video(&ctx).expect("the picture");
+        assert!(bar.contains_rect(stage));
+        assert!((stage.width() / stage.height() - 16.0 / 9.0).abs() < 0.01);
+        // The picture stays on the next frame, with nothing new decoded.
+        render(&mut app, &ctx);
+        assert_eq!(video(&ctx), Some(stage));
+        // The other side turns their video off: back to the bar alone.
+        app.call
+            .as_ref()
+            .and_then(|call| call.video.as_ref())
+            .expect("a feed")
+            .stopped();
+        render(&mut app, &ctx);
+        assert!(video(&ctx).is_none());
+        assert!(
+            ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::call::bar_id()))
+                .is_some_and(|rect| rect.height() < bar.height())
+        );
     }
 
     /// The group dialog offers the pencil and the photo menu only when we may

@@ -13,6 +13,11 @@
 //! answered first, or we hung up while dialling) has the handle its setup
 //! made terminated and its audio closed, instead of coming back to life.
 //!
+//! A video call is answered with video, as the library requires, from a
+//! camera that sends nothing, and our video is then turned off, so the other
+//! side's video is received and shown but none is sent. Calls placed here
+//! are voice calls.
+//!
 //! A second offer while a call rings or runs is declined at once. The
 //! library at this revision sends a reject without a reason, so the caller
 //! sees a decline rather than "busy".
@@ -22,11 +27,12 @@
 
 use super::*;
 use crate::audio::{CallAudio, CallEndpoints};
+use crate::call_video::{Feed, Reception};
 use crate::model::{CallEndReason, CallId, CallMedia, CallPhase};
 use whatsapp_rust::CallError;
 use whatsapp_rust::types::call::{CallAction, CallEndedElsewhere, IncomingCall, MissedCall};
 use whatsapp_rust::voip::audio::WA_SAMPLE_RATE;
-use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination};
+use whatsapp_rust::voip::{CallEvent, CallHandle, CallTermination, KeyframeUrgency, VideoState};
 use whatsapp_rust::wacore::stanza::call::{REJECT_REASON_BUSY, REJECT_REASON_ENC};
 use whatsapp_rust::wacore::voip_control::MediaCloseReason;
 
@@ -37,11 +43,13 @@ const FINISHED: usize = 32;
 /// How long a hang-up at shutdown may take to reach the other side.
 const STOP_TERMINATE: Duration = Duration::from_secs(3);
 
-/// A call the library is running: its handle, and the microphone and
-/// speaker feeding it. Dropping `audio` closes both devices.
+/// A call the library is running: its handle, the microphone and speaker
+/// feeding it, and the other side's video in a video call. Dropping `audio`
+/// closes both devices, and dropping `video` stops its decoder.
 pub(super) struct Live {
     handle: CallHandle,
     audio: CallAudio,
+    video: Option<Reception>,
 }
 
 /// A setup that produced no call.
@@ -57,7 +65,8 @@ pub(super) enum Report {
     /// Answering or placing finished.
     Started {
         id: CallId,
-        result: Result<Live, Failure>,
+        /// Boxed: a running call is large next to the other reports.
+        result: Result<Box<Live>, Failure>,
     },
     /// The library ended the call, or its media failed for good.
     Over { id: CallId, failed: bool },
@@ -94,6 +103,8 @@ pub(super) enum Step<H> {
     },
     /// Follow the running call until the library ends it.
     Watch(CallId),
+    /// The line is open: stop the ringback and play the connect tone.
+    LineOpen(CallId),
     /// Mute or unmute the running call.
     Mute {
         id: CallId,
@@ -147,6 +158,17 @@ impl<H> Default for Calls<H> {
             current: None,
             finished: VecDeque::new(),
         }
+    }
+}
+
+impl Calls<Live> {
+    /// The running call's speaker, so the line can be marked open.
+    fn speaker(&mut self, id: CallId) -> Option<&mut CallAudio> {
+        self.current
+            .as_mut()
+            .filter(|call| call.id == id)
+            .and_then(|call| call.live.as_mut())
+            .map(|live| &mut live.audio)
     }
 }
 
@@ -378,7 +400,12 @@ impl<H> Calls<H> {
             CallPhase::Ringing
         };
         log::info!("call {}: {:?}", id.0, call.phase);
-        let mut steps = vec![Self::state(call, now), Step::Watch(id)];
+        let mut steps = vec![Self::state(call, now)];
+        // Answering opens the line now. A placed call is still ringing there.
+        if call.phase == CallPhase::Connected {
+            steps.push(Step::LineOpen(id));
+        }
+        steps.push(Step::Watch(id));
         if call.muted {
             steps.push(Step::Mute { id, muted: true });
         }
@@ -395,7 +422,7 @@ impl<H> Calls<H> {
             Signal::Accepted if outgoing && call.phase == CallPhase::Ringing => {
                 call.phase = CallPhase::Connected;
                 log::info!("call {}: Connected", call.id.0);
-                let mut steps = vec![Self::state(call, now)];
+                let mut steps = vec![Self::state(call, now), Step::LineOpen(call.id)];
                 if call.muted {
                     steps.push(Step::Mute {
                         id: call.id,
@@ -551,8 +578,8 @@ fn setup_failure(error: &CallError) -> Failure {
 }
 
 /// Opens the microphone and speaker off the runtime's threads.
-async fn open_audio() -> Result<(CallAudio, CallEndpoints), Failure> {
-    let opened = tokio::task::spawn_blocking(|| CallAudio::start(WA_SAMPLE_RATE))
+async fn open_audio(ringback: bool) -> Result<(CallAudio, CallEndpoints), Failure> {
+    let opened = tokio::task::spawn_blocking(move || CallAudio::start(WA_SAMPLE_RATE, ringback))
         .await
         .unwrap_or_else(|_| Err("The call's audio could not start.".to_owned()));
     opened.map_err(|notice| {
@@ -577,9 +604,32 @@ fn ends_badly(event: &CallEvent) -> bool {
     }
 }
 
+/// Whether the other side's video stops at this state of theirs.
+fn video_stops(state: VideoState) -> bool {
+    matches!(
+        state,
+        VideoState::Disabled | VideoState::Paused | VideoState::Stopped
+    )
+}
+
+/// Turns our video off in a video call just answered, leaving the other
+/// side's on, and asks for keyframes on the decoder's behalf from now on.
+async fn receive_only(id: CallId, handle: &CallHandle, video: &Reception) {
+    let asking = handle.clone();
+    video.on_loss(move || asking.request_peer_keyframe(KeyframeUrgency::Coalesced));
+    if let Err(error) = handle.stop_video().await {
+        log::info!(
+            "call {}: our video could not be turned off: {}",
+            id.0,
+            error_label(&error)
+        );
+    }
+}
+
 /// Follows a running call until it ends, and says whether it failed. This
-/// is the call's one reader of its event queue.
-async fn watch(handle: &CallHandle) -> bool {
+/// is the call's one reader of its event queue. The other side turning
+/// their video off clears `video`.
+async fn watch(handle: &CallHandle, video: Option<Feed>) -> bool {
     let events = handle.events();
     let ended = handle.wait_ended();
     tokio::pin!(ended);
@@ -588,6 +638,11 @@ async fn watch(handle: &CallHandle) -> bool {
             () = &mut ended => return false,
             event = events.recv() => match event {
                 Ok(event) if ends_badly(&event) => return true,
+                Ok(CallEvent::PeerVideoStateChanged { state, .. }) if video_stops(state) => {
+                    if let Some(video) = &video {
+                        video.stopped();
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => {
                     ended.await;
@@ -699,7 +754,7 @@ impl Worker {
                 let result = match result {
                     Ok(live) => {
                         let protocol = live.handle.call_id().to_owned();
-                        Ok((live, protocol))
+                        Ok((*live, protocol))
                     }
                     Err(failure) => {
                         if let Some(notice) = failure.notice {
@@ -721,8 +776,12 @@ impl Worker {
     pub(super) async fn end_call_for_stop(&mut self) {
         for step in self.calls.shutdown(now()) {
             match step {
-                Step::Terminate(Live { handle, audio }) => {
-                    drop(audio);
+                Step::Terminate(Live {
+                    handle,
+                    audio,
+                    video,
+                }) => {
+                    drop((audio, video));
                     if tokio::time::timeout(STOP_TERMINATE, handle.terminate())
                         .await
                         .is_err()
@@ -759,20 +818,37 @@ impl Worker {
                     self.call_not_connected(id);
                     return;
                 };
+                let video = self.receive_video(id, &offer);
                 let sender = self.wa_sender.clone();
                 tokio::spawn(async move {
-                    let result = match open_audio().await {
-                        Ok((audio, ends)) => client
-                            .voip()
-                            .accept(&offer)
-                            .audio(ends.source, ends.sink)
-                            .start()
-                            .await
-                            .map(|handle| Live { handle, audio })
-                            .map_err(|error| setup_failure(&error)),
+                    let result = match open_audio(false).await {
+                        Ok((audio, ends)) => {
+                            let voip = client.voip();
+                            let accept = voip.accept(&offer).audio(ends.source, ends.sink);
+                            let accept = match &video {
+                                Some(video) => accept.video(video.source(), video.sink()),
+                                None => accept,
+                            };
+                            match accept.start().await {
+                                Ok(handle) => {
+                                    if let Some(video) = &video {
+                                        receive_only(id, &handle, video).await;
+                                    }
+                                    Ok(Live {
+                                        handle,
+                                        audio,
+                                        video,
+                                    })
+                                }
+                                Err(error) => Err(setup_failure(&error)),
+                            }
+                        }
                         Err(failure) => Err(failure),
                     };
-                    let _ = sender.send(RuntimeEvent::Call(Report::Started { id, result }));
+                    let _ = sender.send(RuntimeEvent::Call(Report::Started {
+                        id,
+                        result: result.map(Box::new),
+                    }));
                 });
             }
             Step::Place { id, chat } => {
@@ -782,27 +858,44 @@ impl Worker {
                 };
                 let sender = self.wa_sender.clone();
                 tokio::spawn(async move {
-                    let result = match open_audio().await {
+                    let result = match open_audio(true).await {
                         Ok((audio, ends)) => client
                             .voip()
                             .call(&peer)
                             .audio(ends.source, ends.sink)
                             .start()
                             .await
-                            .map(|handle| Live { handle, audio })
+                            .map(|handle| Live {
+                                handle,
+                                audio,
+                                video: None,
+                            })
                             .map_err(|error| setup_failure(&error)),
                         Err(failure) => Err(failure),
                     };
-                    let _ = sender.send(RuntimeEvent::Call(Report::Started { id, result }));
+                    let _ = sender.send(RuntimeEvent::Call(Report::Started {
+                        id,
+                        result: result.map(Box::new),
+                    }));
                 });
             }
+            Step::LineOpen(id) => {
+                if let Some(audio) = self.calls.speaker(id) {
+                    audio.line_open();
+                }
+            }
             Step::Watch(id) => {
-                let Some(handle) = self.calls.live(id).map(|live| live.handle.clone()) else {
+                let Some((handle, video)) = self.calls.live(id).map(|live| {
+                    (
+                        live.handle.clone(),
+                        live.video.as_ref().map(Reception::feed),
+                    )
+                }) else {
                     return;
                 };
                 let sender = self.wa_sender.clone();
                 tokio::spawn(async move {
-                    let failed = watch(&handle).await;
+                    let failed = watch(&handle, video).await;
                     if failed {
                         log::warn!("call {}: the media connection failed", id.0);
                     }
@@ -826,8 +919,12 @@ impl Worker {
                     let _ = sender.send(RuntimeEvent::Call(Report::Muted { id, muted }));
                 });
             }
-            Step::Terminate(Live { handle, audio }) => {
-                drop(audio);
+            Step::Terminate(Live {
+                handle,
+                audio,
+                video,
+            }) => {
+                drop((audio, video));
                 tokio::spawn(async move {
                     match handle.terminate().await {
                         CallTermination::PeerNotified | CallTermination::AlreadyEnded => {}
@@ -835,9 +932,35 @@ impl Worker {
                     }
                 });
             }
-            Step::Release(Live { handle, audio }) => {
-                drop(audio);
+            Step::Release(Live {
+                handle,
+                audio,
+                video,
+            }) => {
+                drop((audio, video));
                 tokio::spawn(async move { handle.hangup_local().await });
+            }
+        }
+    }
+
+    /// Starts receiving the other side's video when `offer` is a video
+    /// call, and hands the interface its feed. A call whose decode thread cannot
+    /// start is answered as a voice call.
+    fn receive_video(&mut self, id: CallId, offer: &IncomingCall) -> Option<Reception> {
+        if !matches!(offer.action, CallAction::Offer { is_video: true, .. }) {
+            return None;
+        }
+        match Reception::start(self.waker.clone()) {
+            Ok(video) => {
+                self.emit(Event::CallVideo {
+                    call: id,
+                    feed: video.feed(),
+                });
+                Some(video)
+            }
+            Err(error) => {
+                log::warn!("call {}: video cannot be shown: {error}", id.0);
+                None
             }
         }
     }
@@ -912,6 +1035,7 @@ mod tests {
                 }
                 Step::Place { id, chat } => format!("place {} {chat}", id.0),
                 Step::Watch(id) => format!("watch {}", id.0),
+                Step::LineOpen(id) => format!("open {}", id.0),
                 Step::Mute { id, muted } => format!("mute {} {muted}", id.0),
                 Step::Terminate(fake) => format!("terminate {}", fake.0),
                 Step::Release(fake) => format!("release {}", fake.0),
@@ -945,6 +1069,7 @@ mod tests {
             summary(&steps),
             [
                 format!("state {} Connected 30", id.0),
+                format!("open {}", id.0),
                 format!("watch {}", id.0)
             ]
         );
@@ -1230,7 +1355,10 @@ mod tests {
         let id = dialled(&mut calls, "P");
         assert_eq!(
             summary(&calls.signal("P", Signal::Accepted, 30)),
-            [format!("state {} Connected 30", id.0)]
+            [
+                format!("state {} Connected 30", id.0),
+                format!("open {}", id.0),
+            ]
         );
         assert!(calls.signal("P", Signal::Accepted, 31).is_empty());
         assert!(
@@ -1328,7 +1456,7 @@ mod tests {
         let steps = calls.started(id, Ok((Fake(9), "P".to_owned())), 20);
         assert_eq!(summary(&steps)[2], format!("mute {} true", id.0));
         let steps = calls.signal("P", Signal::Accepted, 30);
-        assert_eq!(summary(&steps)[1], format!("mute {} true", id.0));
+        assert_eq!(summary(&steps)[2], format!("mute {} true", id.0));
         // The library reports it could not unmute: the call stays muted.
         assert_eq!(calls.set_muted(id, false).len(), 1);
         assert_eq!(
@@ -1482,5 +1610,35 @@ mod tests {
         assert!(!worker.calls.busy());
         worker.start_call("120363000000000042@g.us".to_owned());
         assert!(matches!(sent(&events)[..], [Event::Error(_)]));
+    }
+
+    #[tokio::test]
+    async fn only_a_video_offer_receives_video() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        assert!(
+            worker
+                .receive_video(CallId(1), &offer("A", CALLER, false))
+                .is_none()
+        );
+        assert!(sent(&events).is_empty(), "a voice call has no feed");
+        let video = worker
+            .receive_video(CallId(2), &offer("B", CALLER, true))
+            .expect("a video call receives video");
+        match &sent(&events)[..] {
+            [Event::CallVideo { call, feed }] => {
+                assert_eq!(*call, CallId(2));
+                assert_eq!(*feed, video.feed(), "the interface gets the decoder's feed");
+            }
+            other => panic!("expected the call's feed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_other_sides_video_stops_when_they_turn_it_off() {
+        assert!(video_stops(VideoState::Stopped));
+        assert!(video_stops(VideoState::Paused));
+        assert!(video_stops(VideoState::Disabled));
+        assert!(!video_stops(VideoState::Enabled));
+        assert!(!video_stops(VideoState::UpgradeRequestV2));
     }
 }

@@ -473,6 +473,8 @@ pub struct App {
     ringtone: Option<crate::audio::Ringtone>,
     /// In-chat video player.
     pub video: crate::video::Player,
+    /// The other side's video in the call on screen.
+    pub call_screen: crate::call_video::Screen,
     /// Chat of the loaded video; leaving it stops the video.
     video_chat: Option<ChatId>,
     /// Video to play once its download finishes.
@@ -1057,6 +1059,7 @@ impl App {
             player: Player::new(waker.clone()),
             ringtone: None,
             video: crate::video::Player::new(waker.clone()),
+            call_screen: Default::default(),
             video_chat: None,
             video_wanted: None,
             voice_chat: None,
@@ -2971,9 +2974,11 @@ impl App {
                     chat,
                     name,
                     incoming: true,
+                    media,
                     phase: CallPhase::Ringing,
                     since: 0,
                     muted: false,
+                    video: None,
                 });
             }
             Event::CallState {
@@ -2986,6 +2991,11 @@ impl App {
             Event::CallMuted { call, muted } => {
                 if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
                     view.muted = muted;
+                }
+            }
+            Event::CallVideo { call, feed } => {
+                if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
+                    view.video = Some(feed);
                 }
             }
         }
@@ -3013,9 +3023,11 @@ impl App {
                     chat,
                     name,
                     incoming: false,
+                    media: CallMedia::Voice,
                     phase,
                     since,
                     muted: false,
+                    video: None,
                 });
             }
         }
@@ -12574,6 +12586,45 @@ mod call_tests {
     }
 
     #[test]
+    fn a_video_call_hands_its_feed_to_the_view() {
+        let mut app = app();
+        app.apply_backend_event(
+            Event::CallIncoming {
+                call: CallId(5),
+                chat: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                media: CallMedia::Video,
+            },
+            true,
+        );
+        assert_eq!(
+            app.call.as_ref().map(|call| call.media),
+            Some(CallMedia::Video)
+        );
+        let feed = crate::call_video::Feed::new(crate::backend::Waker::default());
+        // Another call's feed is not this one's.
+        app.apply_backend_event(
+            Event::CallVideo {
+                call: CallId(4),
+                feed: feed.clone(),
+            },
+            true,
+        );
+        assert!(app.call.as_ref().is_some_and(|call| call.video.is_none()));
+        app.apply_backend_event(
+            Event::CallVideo {
+                call: CallId(5),
+                feed: feed.clone(),
+            },
+            true,
+        );
+        assert_eq!(
+            app.call.as_ref().and_then(|call| call.video.clone()),
+            Some(feed)
+        );
+    }
+
+    #[test]
     fn declining_or_hanging_up_clears_the_call_at_once() {
         for hang_up in [false, true] {
             let mut app = app();
@@ -12865,9 +12916,11 @@ mod call_tests {
             chat: GRACE.into(),
             name: "Grace Hopper".into(),
             incoming: false,
+            media: CallMedia::Voice,
             phase: CallPhase::Ringing,
             since: 0,
             muted: false,
+            video: None,
         });
         events
             .send(Event::CallEnded {
@@ -12894,9 +12947,11 @@ mod call_tests {
             chat: GRACE.into(),
             name: "Grace Hopper".into(),
             incoming: false,
+            media: CallMedia::Voice,
             phase: CallPhase::Connected,
             since: 0,
             muted: false,
+            video: None,
         });
         let placed = |commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>| {
             std::iter::from_fn(|| commands.try_recv().ok())

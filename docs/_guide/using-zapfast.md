@@ -263,12 +263,21 @@ Starting a reply before recording includes the quoted message.
 
 ## Calls
 
-The phone button in a one-to-one chat's header places a voice call. A call
-ringing here plays a ring and shows the caller over the window with **Accept**
-and **Decline**. A call being placed or running shows a bar across the top of
-the window with its time, **Mute**, and **Hang up**. ZapFast places and
-answers calls with sound only, through the default microphone and speakers.
+The phone button in a one-to-one chat's header places a voice call. While it
+is being placed, ZapFast plays a ringback until the other person answers, then
+a short tone as the line opens. A call ringing here plays a ring and shows the
+caller over the window with **Accept** and **Decline**. Answering plays that
+same short tone once the line is open. A call being placed or running shows a
+bar across the top of the window with its time, **Mute**, and **Hang up**.
+Calls use the default microphone and speakers.
 Group calls ring on your phone and other linked devices instead.
+
+Video calls are received only for now. ZapFast places voice calls, and it
+answers a video call without using your camera: the other person sees your
+video as off. Their video shows in the call bar, above the chat, once its
+first picture arrives. Until then, and whenever they turn their camera off,
+the bar shows the call alone, as in a voice call. A voice call that the other
+person switches to video stays a voice call here.
 
 When the window is hidden or unfocused, or another number is on screen, a
 ringing call also sends a notification. Clicking it switches to the number
@@ -281,7 +290,7 @@ Behind the [app lock](/settings-and-files/#app-lock), and for calls from a
 locked chat, the notification says only "Incoming call", without the caller's
 name, number, or picture.
 
-Call audio travels over UDP to WhatsApp's call relay servers, as it does from
+Call audio and video travel over UDP to WhatsApp's call relay servers, as from
 your phone, and does not go through the [proxy](/settings-and-files/#settings)
 set in Settings. Calls are not yet included in 0.19.0.
 
