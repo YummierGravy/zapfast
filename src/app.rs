@@ -479,6 +479,8 @@ pub struct App {
     /// Our camera's latest picture during a video call.
     pub(crate) self_preview: Option<crate::call_camera::Preview>,
     pub(crate) self_view: crate::call_camera::SelfView,
+    /// The call's video is in a window of its own, and the bar is slim.
+    pub(crate) call_popped: bool,
     /// Devices the call menu and Settings can offer.
     pub(crate) devices: crate::audio::DeviceList,
     device_inbox: std::sync::Arc<std::sync::Mutex<Option<crate::audio::DeviceList>>>,
@@ -1072,6 +1074,7 @@ impl App {
             call_screen: Default::default(),
             self_preview: None,
             self_view: Default::default(),
+            call_popped: false,
             devices: Default::default(),
             device_inbox: std::sync::Arc::new(std::sync::Mutex::new(None)),
             devices_scanning: false,
@@ -3087,6 +3090,7 @@ impl App {
         };
         self.ringtone = None;
         self.self_preview = None;
+        self.call_popped = false;
         self.clear_call_notification(call);
         // A hidden account's call says nothing over the account on screen.
         if view.incoming || self.events_hidden {
@@ -5030,6 +5034,7 @@ impl App {
             Action::SetCallCamera(call, on) => {
                 self.backend.send(Command::SetCallCamera(call, on));
             }
+            Action::PopOutCall(popped) => self.call_popped = popped && self.call.is_some(),
             Action::PlayVoice { message, path } => self.play_voice(message, path),
             Action::PlayVideo { message, path } => self.play_video(message, path),
             Action::PlayVideoWhenDownloaded(message) => {

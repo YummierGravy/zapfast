@@ -1,6 +1,7 @@
 //! The call interface: the dialog of an incoming call, and the bar of a call
 //! being placed or running, which grows a stage for the other side's video
-//! while there is a picture to show.
+//! while there is a picture to show. A video call's picture can pop out into
+//! a borderless window of its own, and the bar then stays slim.
 
 use std::time::Duration;
 
@@ -207,6 +208,7 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
         // The timer counts without any event to redraw it.
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
+    let mut popped = None;
     let shown = egui::Panel::top("call-bar")
         .show_separator_line(false)
         .frame(
@@ -225,7 +227,10 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
                 let small = BUTTON * 0.75;
                 let camera_button = camera_control(&call);
-                let buttons = if camera_button.is_some() { 4.0 } else { 3.0 };
+                let pop_button = call.media == CallMedia::Video;
+                let buttons = 3.0
+                    + f32::from(u8::from(camera_button.is_some()))
+                    + f32::from(u8::from(pop_button));
                 let name_width = (ui.available_width() - buttons * (small + 8.0)).max(60.0);
                 ui.allocate_ui_with_layout(
                     vec2(name_width, BUTTON * 0.75),
@@ -280,6 +285,18 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                                 .push(Action::SetCallCamera(call.id, !call.camera));
                         }
                     }
+                    if pop_button {
+                        let (icon, label) = if app.call_popped {
+                            (Icon::Minimize, "Show video in the call bar")
+                        } else {
+                            (Icon::ExternalLink, "Pop out video")
+                        };
+                        if round_button(ui, icon, small, palette.outline, palette.text, label)
+                            .clicked()
+                        {
+                            app.actions.push(Action::PopOutCall(!app.call_popped));
+                        }
+                    }
                     devices_button = Some(round_button(
                         ui,
                         Icon::Settings,
@@ -298,6 +315,11 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                 .show(ui.ctx(), app.self_preview.as_ref().filter(|_| call.camera));
             if call.camera {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+            if app.call_popped {
+                // The video has a window of its own.
+                popped = Some((picture.clone(), mine));
+                return None;
             }
             let Some(picture) = &picture else {
                 if let Some(mine) = &mine {
@@ -337,6 +359,227 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
             None => data.remove::<Rect>(video_id()),
         }
     });
+    if let Some((theirs, mine)) = popped {
+        popout(app, ui.ctx(), &call, theirs.as_ref(), mine.as_ref());
+    }
+}
+
+/// The popped-out video window's size when it opens: a phone held upright.
+const POPOUT_SIZE: Vec2 = vec2(420.0, 640.0);
+/// How far in from the window's edge a drag resizes it instead of moving it.
+const RESIZE_BAND: f32 = 8.0;
+
+pub(crate) fn popout_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("call-video-window")
+}
+
+/// The call's video in a borderless window of its own. Their picture covers
+/// the whole window and ours sits small in its corner. A drag anywhere moves
+/// the window, its edges resize it, and the controls show while the pointer
+/// is over it. Closing it puts the video back in the call bar.
+fn popout(
+    app: &mut App,
+    ctx: &egui::Context,
+    call: &CallView,
+    theirs: Option<&egui::TextureHandle>,
+    mine: Option<&egui::TextureHandle>,
+) {
+    let builder = egui::ViewportBuilder::default()
+        .with_title(format!("{} - ZapFast", call.name))
+        .with_app_id("zapfast-call")
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_inner_size(POPOUT_SIZE)
+        .with_min_inner_size([160.0, 120.0]);
+    ctx.show_viewport_immediate(popout_id(), builder, |ui, _class| {
+        if ui.input(|input| input.viewport().close_requested()) {
+            app.actions.push(Action::PopOutCall(false));
+        }
+        let window = ui.max_rect();
+        let painter = ui.painter();
+        painter.rect_filled(window, CornerRadius::ZERO, Color32::BLACK);
+        match theirs {
+            Some(picture) => {
+                egui::Image::new((picture.id(), window.size()))
+                    .uv(cover_uv(picture.size_vec2(), window.size()))
+                    .paint_at(ui, window);
+            }
+            None => {
+                let galley = painter.layout(
+                    format!("{}\n{}", call.name, status(call, now_ms())),
+                    theme::medium(15.0),
+                    Color32::WHITE,
+                    window.width() - 24.0,
+                );
+                painter.galley(
+                    window.center() - galley.size() / 2.0,
+                    galley,
+                    Color32::WHITE,
+                );
+            }
+        }
+        if let Some(mine) = mine {
+            paint_self(ui, mine, self_corner(window, mine.size_vec2()));
+        }
+        let body = ui.interact(window, ui.id().with("move"), Sense::click_and_drag());
+        if body.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if body.double_clicked() {
+            app.actions.push(Action::PopOutCall(false));
+        }
+        resize_edges(ui, window);
+        if ui.rect_contains_pointer(window) {
+            popout_controls(app, ui, call, window);
+        }
+    });
+}
+
+/// The part of a picture that covers a window of `room` without stretching:
+/// the middle, with what does not fit cut from both sides.
+fn cover_uv(picture: Vec2, room: Vec2) -> Rect {
+    if picture.x <= 0.0 || picture.y <= 0.0 || room.x <= 0.0 || room.y <= 0.0 {
+        return Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    }
+    let scale = (room.x / picture.x).max(room.y / picture.y);
+    let shown = room / (picture * scale);
+    Rect::from_center_size(pos2(0.5, 0.5), shown)
+}
+
+/// Where our picture sits in the popped-out window: the bottom right corner,
+/// a quarter of the window's width and no wider than 160 points.
+fn self_corner(window: Rect, mine: Vec2) -> Rect {
+    const MARGIN: f32 = 12.0;
+    let width = (window.width() * 0.25).min(160.0);
+    let height = width * mine.y / mine.x.max(1.0);
+    Rect::from_min_size(
+        window.right_bottom() - vec2(width + MARGIN, height + MARGIN),
+        vec2(width, height),
+    )
+}
+
+/// Bands along the window's edges and corners that resize it.
+fn resize_edges(ui: &mut egui::Ui, window: Rect) {
+    use egui::{CursorIcon as Cursor, ResizeDirection as Direction};
+    let band = RESIZE_BAND;
+    let (left, right, top, bottom) = (window.left(), window.right(), window.top(), window.bottom());
+    let edges = [
+        (
+            Rect::from_min_max(pos2(left + band, top), pos2(right - band, top + band)),
+            Direction::North,
+            Cursor::ResizeNorth,
+        ),
+        (
+            Rect::from_min_max(pos2(left + band, bottom - band), pos2(right - band, bottom)),
+            Direction::South,
+            Cursor::ResizeSouth,
+        ),
+        (
+            Rect::from_min_max(pos2(left, top + band), pos2(left + band, bottom - band)),
+            Direction::West,
+            Cursor::ResizeWest,
+        ),
+        (
+            Rect::from_min_max(pos2(right - band, top + band), pos2(right, bottom - band)),
+            Direction::East,
+            Cursor::ResizeEast,
+        ),
+        (
+            Rect::from_min_size(pos2(left, top), Vec2::splat(band)),
+            Direction::NorthWest,
+            Cursor::ResizeNorthWest,
+        ),
+        (
+            Rect::from_min_size(pos2(right - band, top), Vec2::splat(band)),
+            Direction::NorthEast,
+            Cursor::ResizeNorthEast,
+        ),
+        (
+            Rect::from_min_size(pos2(left, bottom - band), Vec2::splat(band)),
+            Direction::SouthWest,
+            Cursor::ResizeSouthWest,
+        ),
+        (
+            Rect::from_min_size(pos2(right - band, bottom - band), Vec2::splat(band)),
+            Direction::SouthEast,
+            Cursor::ResizeSouthEast,
+        ),
+    ];
+    for (index, (rect, direction, cursor)) in edges.into_iter().enumerate() {
+        let response = ui
+            .interact(rect, ui.id().with(("resize", index)), Sense::drag())
+            .on_hover_cursor(cursor);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+}
+
+/// Mute, camera, back to the call bar, and hang up, along the bottom of the
+/// popped-out window while the pointer is over it.
+fn popout_controls(app: &mut App, ui: &mut egui::Ui, call: &CallView, window: Rect) {
+    const SIZE: f32 = 40.0;
+    const GAP: f32 = 10.0;
+    let palette = app.palette;
+    let camera = camera_control(call);
+    let count = 3.0 + f32::from(u8::from(camera.is_some()));
+    let width = count * SIZE + (count - 1.0) * GAP;
+    let row = Rect::from_center_size(
+        pos2(window.center().x, window.bottom() - 16.0 - SIZE / 2.0),
+        vec2(width, SIZE),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(row)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            let (icon, label, fill, color) = if call.muted {
+                (Icon::MicOff, "Unmute", palette.text, palette.panel)
+            } else {
+                (Icon::Mic, "Mute", palette.outline, palette.text)
+            };
+            if round_button(ui, icon, SIZE, fill, color, label).clicked() {
+                app.actions.push(Action::SetCallMuted(call.id, !call.muted));
+            }
+            if let Some((icon, label, lit)) = camera {
+                let (fill, color) = if lit {
+                    (palette.text, palette.panel)
+                } else {
+                    (palette.outline, palette.text)
+                };
+                if round_button(ui, icon, SIZE, fill, color, label).clicked() {
+                    app.actions
+                        .push(Action::SetCallCamera(call.id, !call.camera));
+                }
+            }
+            if round_button(
+                ui,
+                Icon::Minimize,
+                SIZE,
+                palette.outline,
+                palette.text,
+                "Show video in the call bar",
+            )
+            .clicked()
+            {
+                app.actions.push(Action::PopOutCall(false));
+            }
+            if round_button(
+                ui,
+                Icon::PhoneOff,
+                SIZE,
+                palette.danger,
+                Color32::WHITE,
+                "Hang up",
+            )
+            .clicked()
+            {
+                app.actions.push(Action::HangUp(call.id));
+            }
+        },
+    );
 }
 
 /// Where the other side's picture and ours go on the stage. Ours sits against
@@ -525,6 +768,34 @@ mod tests {
         assert_eq!(status(&call, 0), "Incoming video call");
         call.media = CallMedia::Voice;
         assert_eq!(status(&call, 0), "Incoming voice call");
+    }
+
+    #[test]
+    fn a_popped_out_picture_covers_its_window_from_the_middle() {
+        // A wide picture in a tall window: its sides are cut evenly.
+        let uv = cover_uv(vec2(1280.0, 720.0), vec2(360.0, 640.0));
+        assert!((uv.height() - 1.0).abs() < 1e-4);
+        assert!((uv.width() - (360.0 / 640.0) / (1280.0 / 720.0)).abs() < 1e-4);
+        assert!((uv.center().x - 0.5).abs() < 1e-4);
+        // The same shape fills it whole.
+        let whole = cover_uv(vec2(360.0, 640.0), vec2(720.0, 1280.0));
+        assert!((whole.size() - Vec2::splat(1.0)).length() < 1e-4);
+        assert_eq!(
+            cover_uv(Vec2::ZERO, vec2(10.0, 10.0)).size(),
+            Vec2::splat(1.0)
+        );
+    }
+
+    #[test]
+    fn our_picture_sits_in_the_popped_out_windows_corner() {
+        let window = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let mine = self_corner(window, vec2(240.0, 320.0));
+        assert_eq!(mine.width(), 160.0, "no wider than 160 points");
+        assert!((mine.height() - 160.0 * 320.0 / 240.0).abs() < 1e-3);
+        assert!(window.contains_rect(mine));
+        assert!(mine.right() > 780.0 && mine.bottom() > 580.0);
+        let small = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 300.0));
+        assert_eq!(self_corner(small, vec2(240.0, 320.0)).width(), 50.0);
     }
 
     #[test]

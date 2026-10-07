@@ -2178,7 +2178,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     message.status = crate::model::Delivery::Failed;
                 }
             }
-            "call-incoming" | "call-active" | "call-video" => {
+            "call-incoming" | "call-active" | "call-video" | "call-popped" => {
                 use crate::call_video::{Feed, Picture};
                 use crate::model::{CallId, CallMedia, CallPhase, CallView};
                 let chat = app
@@ -2188,7 +2188,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 let incoming = part == "call-incoming";
                 // A connected video call showing a synthetic picture, as
                 // the decode thread would hand it over.
-                let video = (part == "call-video").then(|| {
+                let video = matches!(part, "call-video" | "call-popped").then(|| {
                     let feed = Feed::new(crate::backend::Waker::default());
                     feed.put(Picture::pattern(640, 360));
                     feed
@@ -2215,6 +2215,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     camera: video.is_some(),
                     video,
                 });
+                app.call_popped = part == "call-popped";
             }
             "info" => {
                 app.dialog = app.open_chat.clone().map(Dialog::ChatInfo);
@@ -4335,6 +4336,7 @@ mod tests {
             "call-incoming",
             "call-active",
             "call-video",
+            "call-popped",
             "forward",
             "unlink",
             "leave-group",
@@ -4691,6 +4693,25 @@ mod tests {
             ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::call::bar_id()))
                 .is_some_and(|rect| rect.height() < bar.height())
         );
+    }
+
+    /// A popped-out video leaves the call bar slim, without its stage, and
+    /// putting it back brings the stage back.
+    #[test]
+    fn a_popped_out_video_leaves_the_bar_slim() {
+        let rect =
+            |ctx: &egui::Context, id: egui::Id| ctx.data(|data| data.get_temp::<egui::Rect>(id));
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("call-popped"));
+        render(&mut app, &ctx);
+        let bar = rect(&ctx, crate::ui::call::bar_id()).expect("the bar");
+        assert!(rect(&ctx, crate::ui::call::video_id()).is_none());
+        assert!(bar.height() < 80.0, "a slim bar, {bar:?}");
+        app.call_popped = false;
+        render(&mut app, &ctx);
+        assert!(rect(&ctx, crate::ui::call::video_id()).is_some());
     }
 
     /// The group dialog offers the pencil and the photo menu only when we may

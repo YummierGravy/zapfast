@@ -296,6 +296,13 @@ answer within a few seconds. **Cancel switching to video** withdraws the
 request. When the other person switches to video, their picture appears in
 the call bar at once and your camera stays off: **Turn camera on** sends it.
 
+**Pop out video** in a video call's bar moves the picture into a window of its
+own, without a frame, and the bar goes back to its slim size. Their video fills
+the window and yours sits small in its corner. Drag anywhere to move the window
+and drag its edges to resize it. Pointing at it shows **Mute**, the camera,
+**Show video in the call bar**, and **Hang up**; double-clicking or closing the
+window also puts the video back in the bar.
+
 A call also leaves a line in the chat: incoming, outgoing, ongoing (with the
 time so far), how long an answered call lasted, or missed, declined, cancelled,
 unanswered, or failed. A finished line can be tapped to call back.

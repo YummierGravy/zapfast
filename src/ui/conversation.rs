@@ -1767,7 +1767,7 @@ fn estimated_height(message: &Message, width: f32, new_day: bool) -> f32 {
         Content::Document { caption, .. } => 70.0 + caption_rows(caption),
         Content::Sticker { .. } => 140.0,
         Content::Audio { .. } => 60.0,
-        Content::Call { .. } => 56.0,
+        Content::Call { .. } => 36.0,
         _ => 40.0,
     };
     // Bubble padding, the sender line, and the row spacing, plus the date
@@ -4986,38 +4986,54 @@ fn content(
             if record.live() {
                 ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
-            let title = record.title(*video);
-            let detail = record.detail(view.now);
-            mirrored_row(
-                ui,
-                own,
-                |ui| {
-                    theme::icon(ui, icon, 18.0, color);
-                },
-                |ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        widgets::rich_text(ui, title, theme::medium(14.0), palette.text);
-                        if !detail.is_empty() {
-                            widgets::rich_text(
-                                ui,
-                                &detail,
-                                theme::regular(12.5),
-                                palette.secondary,
-                            );
-                        }
-                    });
-                },
+            let title = ui.painter().layout_no_wrap(
+                record.title(*video).to_owned(),
+                theme::medium(14.0),
+                palette.text,
             );
+            let detail = record.detail(view.now);
+            let detail = (!detail.is_empty()).then(|| {
+                ui.painter()
+                    .layout_no_wrap(detail, theme::regular(12.5), palette.secondary)
+            });
             let callable = record.finished()
                 && view.chat.kind == crate::model::ChatKind::Direct
                 && !view.chat.is_channel();
-            if callable {
-                let response = ui.interact(
-                    ui.min_rect(),
-                    ui.id().with(("call-back", &message.id)),
-                    Sense::click(),
+            // Sized to its words, with the time at the end of the last line
+            // as on a short text message, so the bubble neither spans the
+            // chat nor closes under a line of its own.
+            const ICON: f32 = 18.0;
+            const GAP: f32 = 8.0;
+            let last = detail.as_ref().unwrap_or(&title).size();
+            let text_width = title.size().x.max(last.x + 12.0 + reserve);
+            let height = title.size().y + detail.as_ref().map_or(0.0, |line| 1.0 + line.size().y);
+            let (rect, response) = ui.allocate_exact_size(
+                vec2(ICON + GAP + text_width, height),
+                if callable {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                },
+            );
+            theme::paint_icon(
+                ui,
+                icon,
+                Rect::from_min_size(rect.left_top(), vec2(ICON, title.size().y.max(ICON))),
+                ICON,
+                color,
+            );
+            let text = rect.left() + ICON + GAP;
+            let painter = ui.painter();
+            painter.galley(pos2(text, rect.top()), title, palette.text);
+            if let Some(line) = detail {
+                painter.galley(
+                    pos2(text, rect.bottom() - line.size().y),
+                    line,
+                    palette.secondary,
                 );
+            }
+            if callable {
+                let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
                 if response.clicked() {
                     if *video {
                         actions.push(Action::StartVideoCall(message.chat.clone()));
@@ -5026,7 +5042,10 @@ fn content(
                     }
                 }
             }
-            None
+            Some(Rect::from_min_max(
+                pos2(rect.right() - reserve, rect.bottom() - last.y),
+                rect.right_bottom(),
+            ))
         }
         Content::PhoneOnly {
             live_location: true,

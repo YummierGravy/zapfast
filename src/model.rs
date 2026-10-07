@@ -1515,6 +1515,9 @@ pub enum Action {
     SetCallMuted(CallId, bool),
     /// Turns our camera on or off during a video call.
     SetCallCamera(CallId, bool),
+    /// Moves the call's video into a window of its own (`true`), or back
+    /// into the call bar.
+    PopOutCall(bool),
     /// Microphone, speaker, and camera for calls. An empty name is the
     /// system default, or the first camera.
     SetCallDevices {
