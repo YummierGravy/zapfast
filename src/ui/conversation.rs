@@ -142,7 +142,9 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                 let picture = app.avatar(&chat.id);
                 let (subtitle, color) = subtitle(app, chat);
                 // More and Search, and Back in a narrow window.
-                let right_controls = if narrow { 108.0 } else { 72.0 };
+                let can_call = chat.kind == crate::model::ChatKind::Direct && !chat.is_channel();
+                let right_controls =
+                    if narrow { 108.0 } else { 72.0 } + if can_call { 36.0 } else { 0.0 };
                 // Treat the avatar, name, and subtitle as one info button.
                 let block = ui
                     .scope(|ui| {
@@ -337,6 +339,25 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                 app.actions.push(Action::CloseChat);
                             }
                         });
+                    // Voice calls go to one person; groups and channels wait.
+                    if can_call {
+                        let free = app.call.is_none() && app.is_connected();
+                        let call = ui
+                            .add_enabled_ui(free, |ui| {
+                                theme::icon_button(
+                                    ui,
+                                    Icon::Phone,
+                                    18.0,
+                                    palette.secondary,
+                                    palette.text,
+                                    "Voice call",
+                                )
+                            })
+                            .inner;
+                        if call.clicked() {
+                            app.actions.push(Action::StartCall(chat.id.clone()));
+                        }
+                    }
                     let searching = app.chat_search_open;
                     let tip = format!(
                         "{} ({})",

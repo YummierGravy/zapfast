@@ -53,6 +53,16 @@ fn password(app: &mut App, ui: &mut egui::Ui) {
         theme::regular(13.5),
         palette.secondary,
     );
+    // A call rings behind the lock without saying who; it is answered once
+    // unlocked, where its dialog shows.
+    if app.ringing_anywhere() {
+        theme::paragraph(
+            ui,
+            gettext(locale, "Incoming call. Unlock to answer."),
+            theme::semibold(13.5),
+            palette.accent,
+        );
+    }
     let id = egui::Id::new(PASSWORD_ID);
     // TextEdit surrenders focus on Enter; take the key before drawing it.
     let mut submit = ui.memory(|memory| memory.has_focus(id))

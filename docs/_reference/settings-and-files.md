@@ -149,6 +149,8 @@ name or description, in the interface language or in English.
   `http://host:port`, each with an optional `user:password@`; a bare
   `host:port` is an HTTP proxy. Changing it reconnects at once. Empty uses
   `ALL_PROXY` or `HTTPS_PROXY` from the environment and honors `NO_PROXY`.
+  Call audio does not use the proxy: it goes over UDP to WhatsApp's call
+  relay servers. See [Calls](/using-zapfast/#calls).
 - **GIPHY API key**: for GIF search, unless the build includes one. Set
   `ZAPFAST_GIPHY_KEY` at compile time to include a default key. The earlier
   `FASTSAPP_GIPHY_KEY` remains a fallback for existing builds.
@@ -191,6 +193,10 @@ While locked, the window shows only the lock screen. Messages keep arriving
 but stay unread, and notifications say only "New message", without the chat,
 sender, text, or picture. Clicking one opens the message after you unlock.
 Voice messages and videos stop, and a recording in progress is discarded.
+An incoming call still rings, but its notification and the lock screen say
+only "Incoming call", without the caller's name or number. Answering and
+declining wait for the unlock; a call still ringing then shows its dialog,
+and clicking a call's notification switches to the number it called.
 
 Wrong passwords make the next try wait, up to half a minute. **Forgot
 password? Unlink this computer** is the only way back in without it: it

@@ -233,7 +233,8 @@ pub struct AppLock {
     /// The last try was wrong.
     pub wrong: bool,
     pub forgetting: Forgetting,
-    /// A notification clicked while locked, opened once unlocked.
+    /// A notification clicked while locked, opened once unlocked: its
+    /// message, or for a call its account, where a call still ringing shows.
     pub deferred: Option<crate::notify::NotificationTarget>,
     /// The Settings password form, when open.
     pub form: Option<Form>,

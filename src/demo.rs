@@ -2158,6 +2158,29 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     message.status = crate::model::Delivery::Failed;
                 }
             }
+            "call-incoming" | "call-active" => {
+                use crate::model::{CallId, CallPhase, CallView};
+                let chat = app
+                    .open_chat
+                    .clone()
+                    .unwrap_or_else(|| SAMPLES[0].id.to_owned());
+                let incoming = part == "call-incoming";
+                app.call = Some(CallView {
+                    id: CallId(1),
+                    name: app
+                        .chat(&chat)
+                        .map_or_else(String::new, |chat| app.chat_title(chat)),
+                    chat,
+                    incoming,
+                    phase: if incoming {
+                        CallPhase::Ringing
+                    } else {
+                        CallPhase::Connected
+                    },
+                    since: crate::util::now() * 1000 - 83_000,
+                    muted: false,
+                });
+            }
             "info" => {
                 app.dialog = app.open_chat.clone().map(Dialog::ChatInfo);
             }
@@ -4274,6 +4297,8 @@ mod tests {
             "group-info-rename",
             "group-info-locked",
             "group-info-saving",
+            "call-incoming",
+            "call-active",
             "forward",
             "unlink",
             "leave-group",
@@ -4564,6 +4589,33 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    /// The incoming-call dialog and the in-call bar are drawn for a direct
+    /// chat, each only in its own state.
+    #[test]
+    fn calls_draw_their_dialog_and_bar() {
+        let area = |ctx: &egui::Context, id: &str| {
+            ctx.memory(|memory| memory.area_rect(egui::Id::new(id)))
+        };
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("call-incoming"));
+        render(&mut app, &ctx);
+        assert!(area(&ctx, "incoming-call").is_some());
+        let bar = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::call::bar_id()))
+        };
+        assert!(bar(&ctx).is_none());
+
+        let mut app = self::app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("call-active"));
+        render(&mut app, &ctx);
+        assert!(area(&ctx, "incoming-call").is_none());
+        assert!(bar(&ctx).is_some_and(|rect| rect.height() > 0.0));
     }
 
     /// The group dialog offers the pencil and the photo menu only when we may

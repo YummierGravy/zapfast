@@ -70,6 +70,8 @@ pub struct Account {
     pub account_privacy: crate::privacy::Snapshot,
     pub interactive_sending: HashSet<(ChatId, String)>,
     pub group_saving: HashSet<ChatId>,
+    /// The call ringing, being placed, or running. One at a time.
+    pub call: Option<crate::model::CallView>,
     pub(crate) reported_online: Option<bool>,
     /// Chats this account may pin; WhatsApp Plus raises it once known.
     pub pin_limit: usize,
@@ -136,6 +138,7 @@ impl Account {
             account_privacy: crate::privacy::Snapshot::default(),
             interactive_sending: HashSet::new(),
             group_saving: HashSet::new(),
+            call: None,
             reported_online: None,
             pin_limit: crate::backend::PINNED_CHATS,
         }

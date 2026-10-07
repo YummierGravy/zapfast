@@ -732,6 +732,55 @@ const CAPTURE_QUEUE: usize = 3;
 /// so a stall cannot build up seconds of delay.
 const PLAYOUT_QUEUE: usize = 8;
 
+/// The ring of an incoming call, synthesized here and repeated until dropped.
+pub struct Ringtone {
+    // The sink plays only while its device is open.
+    _device: rodio::MixerDeviceSink,
+    sink: rodio::Player,
+}
+
+impl Ringtone {
+    pub fn start() -> Result<Self, String> {
+        let device = open_output().map_err(|error| format!("No sound output: {error}"))?;
+        let sink = rodio::Player::connect_new(device.mixer());
+        sink.append(SamplesBuffer::new(mono(), rate(), ring_cycle()).repeat_infinite());
+        sink.play();
+        Ok(Self {
+            _device: device,
+            sink,
+        })
+    }
+}
+
+impl Drop for Ringtone {
+    fn drop(&mut self) {
+        self.sink.stop();
+    }
+}
+
+/// Two short double tones and a pause, the cadence of a phone ringing.
+fn ring_cycle() -> Vec<f32> {
+    let rate = voice::RATE as f32;
+    let tone = |seconds: f32| {
+        let length = (seconds * rate) as usize;
+        let fade = (0.02 * rate) as usize;
+        (0..length).map(move |n| {
+            let t = n as f32 / rate;
+            let wave = (std::f32::consts::TAU * 440.0 * t).sin()
+                + (std::f32::consts::TAU * 480.0 * t).sin();
+            // Ramps at both ends keep the tone from clicking.
+            let edge = n.min(length - 1 - n).min(fade) as f32 / fade as f32;
+            wave * 0.5 * 0.25 * edge
+        })
+    };
+    let silence = |seconds: f32| std::iter::repeat_n(0.0, (seconds * rate) as usize);
+    tone(0.4)
+        .chain(silence(0.2))
+        .chain(tone(0.4))
+        .chain(silence(2.0))
+        .collect()
+}
+
 /// The ends of a call's audio that the library holds: it reads microphone
 /// frames from `source` and writes what the other side said to `sink`. Both
 /// carry mono `i16` samples, and each `source` frame has exactly 960 of them.
@@ -976,6 +1025,15 @@ mod tests {
             None,
             "a clip the reader stopped is not one that played to its end"
         );
+    }
+
+    #[test]
+    fn the_ring_is_quiet_and_whole_seconds_long() {
+        let cycle = ring_cycle();
+        assert_eq!(cycle.len(), (voice::RATE as f32 * 3.0) as usize);
+        assert!(cycle.iter().all(|sample| sample.abs() <= 0.25));
+        assert!(cycle.iter().any(|sample| sample.abs() > 0.1));
+        assert_eq!(cycle[0], 0.0);
     }
 
     #[test]

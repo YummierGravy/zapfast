@@ -261,6 +261,30 @@ microphone. Press Enter or the send button to send the recording, or Escape or
 the delete button to discard it. ZapFast raises the volume of quiet recordings.
 Starting a reply before recording includes the quoted message.
 
+## Calls
+
+The phone button in a one-to-one chat's header places a voice call. A call
+ringing here plays a ring and shows the caller over the window with **Accept**
+and **Decline**. A call being placed or running shows a bar across the top of
+the window with its time, **Mute**, and **Hang up**. ZapFast places and
+answers calls with sound only, through the default microphone and speakers.
+Group calls ring on your phone and other linked devices instead.
+
+When the window is hidden or unfocused, or another number is on screen, a
+ringing call also sends a notification. Clicking it switches to the number
+being called, where the call shows. With several numbers linked, only one can
+be in a call at a time: while one is, the others cannot place a call. A call
+on a number that is not on screen leaves the open chat, its draft, and any
+playing media alone.
+
+Behind the [app lock](/settings-and-files/#app-lock), and for calls from a
+locked chat, the notification says only "Incoming call", without the caller's
+name, number, or picture.
+
+Call audio travels over UDP to WhatsApp's call relay servers, as it does from
+your phone, and does not go through the [proxy](/settings-and-files/#settings)
+set in Settings. Calls are not yet included in 0.19.0.
+
 ## Copying
 
 Select and copy any message text. A selection across messages uses WhatsApp's
@@ -327,7 +351,8 @@ link shows the group and joins it without leaving ZapFast.
 
 **Lock chat** in a chat's right-click menu moves it into a locked folder: it
 leaves the chat list, search, and the unread count, and never raises a
-notification. The lock syncs with your phone and other linked devices.
+notification for a message. A call from a locked chat still rings, with a
+notification that names nobody. The lock syncs with your phone and other linked devices.
 
 Choose **Locked** beside the chat filters and type your local code to open
 them; the first time, ZapFast offers to set one up. The code is separate from
@@ -375,6 +400,7 @@ they announced when clicked. On Linux, a notification that arrives while the
 window is open behind others also highlights ZapFast in the taskbar until you
 switch to it. Muted chats do not send notifications, and
 archived chats stay quiet while they remain archived. You can change both settings.
+Incoming calls notify too; see [Calls](#calls).
 
 Press `Ctrl+/` or click the keyboard button under the composer to list all
 shortcuts.

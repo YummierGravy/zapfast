@@ -19,7 +19,7 @@ https://github.com/user-attachments/assets/2bf86b54-45fc-4add-8de7-c426c3cdad9b
 - [What is ZapFast?](https://zapfast.rocks/what-is-zapfast/): what it does and does not do yet
 - [Download](https://zapfast.rocks/download/): Linux, macOS, and Windows
 - [Getting started](https://zapfast.rocks/getting-started/): linking your phone, building from source
-- [Using ZapFast](https://zapfast.rocks/using-zapfast/): messages, stickers, polls, shortcuts
+- [Using ZapFast](https://zapfast.rocks/using-zapfast/): messages, stickers, polls, calls, shortcuts
 - [Settings & files](https://zapfast.rocks/settings-and-files/): where your data lives, encryption, app lock, updates
 - [Making a theme](https://zapfast.rocks/themes/)
 

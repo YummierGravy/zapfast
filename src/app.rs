@@ -13,9 +13,9 @@ use crate::backend::{Backend, Command, Event, LinkStatus, Refusal, Unsent, Waker
 use crate::i18n::Locale;
 use crate::image_preview::PreviewState;
 use crate::model::{
-    AccountId, Action, Chat, ChatFilter, ChatId, Contact, Content, Delivery, Dialog, Gif, GifError,
-    Label, Media, MediaState, Message, Page, PickerTab, Scroll, SidebarDisplayMode, StickerPack,
-    StickerShelf, Toast, ToastKind,
+    AccountId, Action, CallEndReason, CallId, CallMedia, CallPhase, CallView, Chat, ChatFilter,
+    ChatId, Contact, Content, Delivery, Dialog, Gif, GifError, Label, Media, MediaState, Message,
+    Page, PickerTab, Scroll, SidebarDisplayMode, StickerPack, StickerShelf, Toast, ToastKind,
 };
 use crate::paths::AppDirs;
 use crate::settings::{AccountRoster, NotificationSound, Settings, ThemeChoice};
@@ -469,6 +469,8 @@ pub struct App {
     pub composer_tools_open: bool,
     /// In-chat audio player.
     pub player: Player,
+    /// The ring of the call waiting to be answered.
+    ringtone: Option<crate::audio::Ringtone>,
     /// In-chat video player.
     pub video: crate::video::Player,
     /// Chat of the loaded video; leaving it stops the video.
@@ -1053,6 +1055,7 @@ impl App {
             pending: Vec::new(),
             composer_tools_open: false,
             player: Player::new(waker.clone()),
+            ringtone: None,
             video: crate::video::Player::new(waker.clone()),
             video_chat: None,
             video_wanted: None,
@@ -1502,12 +1505,21 @@ impl App {
                 self.actions.push(Action::ShowWindow);
                 continue;
             }
-            self.switch_account(&target.account);
+            self.open_notification_target(target);
+            self.actions.push(Action::ShowWindow);
+        }
+    }
+
+    /// Switches to a clicked notification's account and opens its message.
+    /// A call's notification opens nothing more: the account's call, if it
+    /// still rings, shows its own dialog there.
+    fn open_notification_target(&mut self, target: crate::notify::NotificationTarget) {
+        self.switch_account(&target.account);
+        if target.call.is_none() {
             self.actions.push(Action::OpenMessage {
                 chat: target.chat,
                 message: target.message,
             });
-            self.actions.push(Action::ShowWindow);
         }
     }
 
@@ -1565,6 +1577,7 @@ impl App {
                 account: self.account().id.clone(),
                 chat: chat_id.to_owned(),
                 message: message.id.clone(),
+                call: None,
             },
             std::sync::Arc::clone(&self.notification_opens),
             move || waker.wake(),
@@ -1592,6 +1605,7 @@ impl App {
                 account: self.account().id.clone(),
                 chat: chat_id.to_owned(),
                 message: message.to_owned(),
+                call: None,
             },
             std::sync::Arc::clone(&self.notification_opens),
             move || waker.wake(),
@@ -2945,13 +2959,160 @@ impl App {
                 self.toast_error(message);
             }
             Event::AccountRemoved => {}
-            // The call interface is not drawn yet.
-            Event::CallIncoming { .. }
-            | Event::CallState { .. }
-            | Event::CallEnded { .. }
-            | Event::CallMuted { .. } => {}
+            Event::CallIncoming {
+                call,
+                chat,
+                name,
+                media,
+            } => {
+                self.notify_call(call, &chat, &name, media);
+                self.call = Some(CallView {
+                    id: call,
+                    chat,
+                    name,
+                    incoming: true,
+                    phase: CallPhase::Ringing,
+                    since: 0,
+                    muted: false,
+                });
+            }
+            Event::CallState {
+                call,
+                chat,
+                phase,
+                since,
+            } => self.call_state(call, chat, phase, since),
+            Event::CallEnded { call, chat, reason } => self.call_ended(call, chat, reason),
+            Event::CallMuted { call, muted } => {
+                if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
+                    view.muted = muted;
+                }
+            }
         }
         self.prune_selection();
+    }
+
+    /// A call moved to `phase`. One this side did not hear about is a call we
+    /// placed.
+    fn call_state(&mut self, call: CallId, chat: ChatId, phase: CallPhase, since: i64) {
+        if phase == CallPhase::Ended {
+            return;
+        }
+        match self.call.as_mut().filter(|view| view.id == call) {
+            Some(view) => {
+                view.phase = phase;
+                view.since = since;
+            }
+            None => {
+                let name = self
+                    .chat(&chat)
+                    .map(|known| self.chat_title(known))
+                    .unwrap_or_else(|| chat.clone());
+                self.call = Some(CallView {
+                    id: call,
+                    chat,
+                    name,
+                    incoming: false,
+                    phase,
+                    since,
+                    muted: false,
+                });
+            }
+        }
+    }
+
+    fn call_ended(&mut self, call: CallId, chat: ChatId, reason: CallEndReason) {
+        let Some(view) = self.call.take_if(|view| view.id == call) else {
+            return;
+        };
+        self.ringtone = None;
+        self.clear_call_notification(call);
+        // A hidden account's call says nothing over the account on screen.
+        if view.incoming || self.events_hidden {
+            return;
+        }
+        let name = self
+            .chat(&chat)
+            .map(|known| self.chat_title(known))
+            .unwrap_or(view.name);
+        match reason {
+            CallEndReason::Rejected => self.toast(format!("{name} declined the call")),
+            CallEndReason::Busy => self.toast(format!("{name} is on another call")),
+            CallEndReason::Missed => self.toast(format!("{name} did not answer")),
+            CallEndReason::Failed => self.toast_error("The call could not be connected"),
+            CallEndReason::HungUp | CallEndReason::EndedElsewhere => {}
+        }
+    }
+
+    /// Announces a call ringing here, unless its dialog is already in front of
+    /// the reader. A hidden account's call always notifies, and the click
+    /// carries its account. Behind the app lock, or from a locked chat, it
+    /// says only "Incoming call", without the caller's name, number or
+    /// picture. The ring is the call's sound, so the notification is silent.
+    fn notify_call(&mut self, call: CallId, chat_id: &str, caller: &str, media: CallMedia) {
+        if !self.account().settings.notifications {
+            return;
+        }
+        let locked = self.app_lock.is_locked();
+        let in_front = !self.events_hidden && !self.window_hidden && self.window_focused && !locked;
+        if in_front {
+            return;
+        }
+        let hide_caller = locked || self.chat(chat_id).is_some_and(|chat| chat.locked);
+        let ((title, body), picture) = if hide_caller {
+            (crate::notify::locked_call_lines(self.locale), None)
+        } else {
+            let picture = self.avatar(chat_id).or_else(|| self.cached_avatar(chat_id));
+            (
+                crate::notify::call_lines(self.locale, caller, media),
+                picture,
+            )
+        };
+        let waker = self.waker.clone();
+        self.notifications.show(
+            title,
+            body,
+            picture,
+            NotificationSound::None,
+            crate::notify::NotificationTarget {
+                account: self.account().id.clone(),
+                chat: chat_id.to_owned(),
+                message: String::new(),
+                call: Some(call),
+            },
+            std::sync::Arc::clone(&self.notification_opens),
+            move || waker.wake(),
+        );
+        self.wants_attention = true;
+    }
+
+    fn clear_call_notification(&mut self, call: CallId) {
+        let account = self.account().id.clone();
+        self.notifications.clear_call(&account, call);
+    }
+
+    /// Whether any account has a call waiting to be answered, on screen or not.
+    pub fn ringing_anywhere(&self) -> bool {
+        self.accounts.iter().any(|account| {
+            account
+                .call
+                .as_ref()
+                .is_some_and(|view| view.incoming && view.phase == CallPhase::Ringing)
+        })
+    }
+
+    /// Rings while a call waits to be answered on any account, behind the
+    /// app lock too; a hidden account's ring is how its call is heard.
+    fn tick_ringtone(&mut self) {
+        if !self.ringing_anywhere() {
+            self.ringtone = None;
+        } else if self.ringtone.is_none() {
+            match crate::audio::Ringtone::start() {
+                Ok(ring) => self.ringtone = Some(ring),
+                // Without a sound device the dialog still shows.
+                Err(error) => log::warn!("the ring could not play: {error}"),
+            }
+        }
     }
 
     fn prune_selection(&mut self) {
@@ -4123,6 +4284,7 @@ impl App {
                     account: self.account().id.clone(),
                     chat,
                     message,
+                    call: None,
                 });
             }
             return;
@@ -4680,6 +4842,47 @@ impl App {
                 }
             }
             Action::ClearPending => self.pending.clear(),
+            Action::StartCall(chat) => {
+                // One call at a time across accounts: they share the
+                // microphone and the speakers.
+                let active = self.active;
+                let elsewhere = self
+                    .accounts
+                    .iter()
+                    .enumerate()
+                    .any(|(index, account)| index != active && account.call.is_some());
+                if elsewhere {
+                    self.toast(crate::i18n::gettext(
+                        self.locale,
+                        "Finish the call on your other account first",
+                    ));
+                } else if self.call.is_none() {
+                    self.backend.send(Command::StartCall(chat));
+                }
+            }
+            Action::AcceptCall(call) => {
+                self.ringtone = None;
+                self.clear_call_notification(call);
+                if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
+                    // The ring ends now; the worker's state follows.
+                    view.phase = CallPhase::Connecting;
+                }
+                self.backend.send(Command::AcceptCall(call));
+            }
+            Action::RejectCall(call) => {
+                self.ringtone = None;
+                self.clear_call_notification(call);
+                self.call.take_if(|view| view.id == call);
+                self.backend.send(Command::RejectCall(call));
+            }
+            Action::HangUp(call) => {
+                self.ringtone = None;
+                self.call.take_if(|view| view.id == call);
+                self.backend.send(Command::HangUp(call));
+            }
+            Action::SetCallMuted(call, muted) => {
+                self.backend.send(Command::SetCallMuted(call, muted));
+            }
             Action::PlayVoice { message, path } => self.play_voice(message, path),
             Action::PlayVideo { message, path } => self.play_video(message, path),
             Action::PlayVideoWhenDownloaded(message) => {
@@ -5855,6 +6058,7 @@ impl App {
         self.handle_events();
         self.tick(ctx);
         self.tick_audio();
+        self.tick_ringtone();
         self.tick_video(ctx);
         self.apply_actions(ctx);
         self.hold_media();
@@ -5957,11 +6161,7 @@ impl App {
                 }
                 self.app_lock.unlocked(matched);
                 if matched && let Some(target) = self.app_lock.deferred.take() {
-                    self.switch_account(&target.account);
-                    self.actions.push(Action::OpenMessage {
-                        chat: target.chat,
-                        message: target.message,
-                    });
+                    self.open_notification_target(target);
                 }
             }
             Outcome::WrongCurrent => {
@@ -6934,6 +7134,7 @@ mod tests {
                 account: AccountId::parse("2").unwrap(),
                 chat: "15550003333@s.whatsapp.net".into(),
                 message: "m1".into(),
+                call: None,
             });
         app.handle_notification_opens();
         assert_eq!(
@@ -9333,6 +9534,7 @@ mod tests {
                 account: crate::model::AccountId::first(),
                 chat: chat.into(),
                 message: "secret".into(),
+                call: None,
             });
 
         app.handle_notification_opens();
@@ -9359,6 +9561,7 @@ mod tests {
                 account: crate::model::AccountId::first(),
                 chat: chat.into(),
                 message: "second".into(),
+                call: None,
             });
 
         app.handle_notification_opens();
@@ -12080,6 +12283,7 @@ mod app_lock_tests {
                 account: crate::model::AccountId::first(),
                 chat: CHAT.into(),
                 message: "m1".into(),
+                call: None,
             });
         app.handle_notification_opens();
         app.apply_actions(&ctx);
@@ -12298,5 +12502,412 @@ mod app_lock_tests {
         assert!(!actions.contains(&Action::FocusComposer));
         let mut app = app_with(settings(None));
         assert!(!press(&mut app).contains(&Action::LockApp));
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+    use crate::model::{CallMedia, ToastKind};
+
+    fn app() -> App {
+        let root = std::env::temp_dir().join(format!("zapfast-calls-{}", std::process::id()));
+        App::headless(AppDirs::under(&root), Settings::default()).0
+    }
+
+    #[test]
+    fn a_call_we_place_shows_until_it_ends() {
+        let mut app = app();
+        let chat = "1@s.whatsapp.net".to_owned();
+        app.apply_backend_event(
+            Event::CallState {
+                call: CallId(3),
+                chat: chat.clone(),
+                phase: CallPhase::Ringing,
+                since: 10,
+            },
+            true,
+        );
+        let call = app.call.clone().expect("the call shows");
+        assert!(!call.incoming);
+        assert_eq!(call.phase, CallPhase::Ringing);
+        app.apply_backend_event(
+            Event::CallState {
+                call: CallId(3),
+                chat: chat.clone(),
+                phase: CallPhase::Connected,
+                since: 99,
+            },
+            true,
+        );
+        assert_eq!(app.call.as_ref().map(|call| call.since), Some(99));
+        app.apply_backend_event(
+            Event::CallMuted {
+                call: CallId(3),
+                muted: true,
+            },
+            true,
+        );
+        assert!(app.call.as_ref().is_some_and(|call| call.muted));
+        // The ended state alone does not clear it; the end does, with a word
+        // for a call the other side turned down.
+        app.apply_backend_event(
+            Event::CallState {
+                call: CallId(3),
+                chat: chat.clone(),
+                phase: CallPhase::Ended,
+                since: 120,
+            },
+            true,
+        );
+        assert!(app.call.is_some());
+        app.apply_backend_event(
+            Event::CallEnded {
+                call: CallId(3),
+                chat,
+                reason: CallEndReason::Rejected,
+            },
+            true,
+        );
+        assert!(app.call.is_none());
+        assert!(app.toasts.iter().any(|toast| toast.kind == ToastKind::Info));
+    }
+
+    #[test]
+    fn declining_or_hanging_up_clears_the_call_at_once() {
+        for hang_up in [false, true] {
+            let mut app = app();
+            app.apply_backend_event(
+                Event::CallIncoming {
+                    call: CallId(1),
+                    chat: "1@s.whatsapp.net".into(),
+                    name: "Ada".into(),
+                    media: CallMedia::Voice,
+                },
+                true,
+            );
+            assert!(app.call.as_ref().is_some_and(|call| call.incoming));
+            let ctx = egui::Context::default();
+            app.actions.push(if hang_up {
+                Action::HangUp(CallId(1))
+            } else {
+                Action::RejectCall(CallId(1))
+            });
+            app.apply_actions(&ctx);
+            assert!(app.call.is_none());
+            assert!(app.ringtone.is_none());
+        }
+    }
+
+    #[test]
+    fn accepting_ends_the_ring_and_a_second_call_is_not_placed() {
+        let mut app = app();
+        app.apply_backend_event(
+            Event::CallIncoming {
+                call: CallId(1),
+                chat: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                media: CallMedia::Voice,
+            },
+            true,
+        );
+        let ctx = egui::Context::default();
+        app.actions.push(Action::AcceptCall(CallId(1)));
+        app.apply_actions(&ctx);
+        assert_eq!(
+            app.call.as_ref().map(|call| call.phase),
+            Some(CallPhase::Connecting)
+        );
+        app.actions
+            .push(Action::StartCall("2@s.whatsapp.net".into()));
+        app.apply_actions(&ctx);
+        assert_eq!(app.call.as_ref().map(|call| call.id), Some(CallId(1)));
+    }
+
+    const PASSWORD: &str = "open-sesame";
+    const ADA: &str = "15550001111@s.whatsapp.net";
+    const GRACE: &str = "15550003333@s.whatsapp.net";
+
+    fn ringing(chat: &str, name: &str) -> Event {
+        Event::CallIncoming {
+            call: CallId(1),
+            chat: chat.into(),
+            name: name.into(),
+            media: CallMedia::Voice,
+        }
+    }
+
+    /// A linked app on its first account, locked when `password` is set.
+    fn linked(directory: &std::path::Path, password: Option<&str>) -> App {
+        let settings = Settings {
+            app_lock_hash: password.map(crate::app_lock::verifier),
+            ..Settings::default()
+        };
+        let mut app = App::headless(AppDirs::under(directory), settings).0;
+        app.link = LinkStatus::Connected;
+        app.chats.push(Chat::new(ADA.into(), "Ada Lovelace".into()));
+        app
+    }
+
+    /// Adds a second, hidden account calling from Grace's chat; returns its
+    /// event channel.
+    fn second_account(app: &mut App) -> std::sync::mpsc::Sender<Event> {
+        let (mut second, events) = Account::detached(
+            &app.dirs,
+            AccountId::parse("2").unwrap(),
+            crate::settings::AccountSettings::default(),
+        )
+        .unwrap();
+        second.link = LinkStatus::Connected;
+        second
+            .chats
+            .push(Chat::new(GRACE.into(), "Grace Hopper".into()));
+        app.accounts.push(second);
+        app.active = 0;
+        events
+    }
+
+    /// Draws a frame and says whether the incoming-call dialog was in it.
+    fn shows_incoming_dialog(app: &mut App, ctx: &egui::Context) -> bool {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.frame_ui(ui));
+        output.textures_delta.clear();
+        ctx.memory(|memory| memory.area_rect(egui::Id::new("incoming-call")))
+            .is_some()
+    }
+
+    fn unlock(app: &mut App, ctx: &egui::Context) {
+        app.app_lock.entry = PASSWORD.into();
+        app.apply(Action::UnlockApp, ctx);
+        let outcome = app.app_lock.wait().expect("a finished check");
+        app.app_lock_outcome(outcome);
+        app.apply_actions(ctx);
+        assert!(!app.app_lock.is_locked());
+    }
+
+    #[test]
+    fn a_call_behind_the_lock_rings_nameless_and_is_answered_after_unlocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = linked(directory.path(), Some(PASSWORD));
+        app.attach(&ctx);
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        assert!(app.app_lock.is_locked());
+        app.apply_backend_event(ringing(ADA, "Ada Lovelace"), true);
+
+        let shown = app.notifications.shown.last().expect("the call notifies");
+        assert_eq!(shown.title, "ZapFast");
+        assert_eq!(shown.body, "Incoming call");
+        assert_eq!(shown.picture, None);
+        assert_eq!(shown.target.call, Some(CallId(1)));
+        // The ring plays behind the lock; the notification adds no sound.
+        assert_eq!(shown.sound, NotificationSound::None);
+        assert!(app.ringing_anywhere());
+
+        // Answering, declining and hanging up wait for the unlock.
+        for action in [
+            Action::AcceptCall(CallId(1)),
+            Action::RejectCall(CallId(1)),
+            Action::HangUp(CallId(1)),
+        ] {
+            app.actions.push(action);
+        }
+        app.apply_actions(&ctx);
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .next()
+                .is_none()
+        );
+        assert!(!shows_incoming_dialog(&mut app, &ctx));
+
+        unlock(&mut app, &ctx);
+        assert_eq!(
+            app.call.as_ref().map(|call| call.phase),
+            Some(CallPhase::Ringing)
+        );
+        assert!(
+            shows_incoming_dialog(&mut app, &ctx),
+            "the call still rings"
+        );
+        app.actions.push(Action::AcceptCall(CallId(1)));
+        app.apply_actions(&ctx);
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::AcceptCall(CallId(1))))
+        );
+    }
+
+    #[test]
+    fn a_locked_chats_call_names_nobody() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = linked(directory.path(), None);
+        app.chats[0].locked = true;
+        app.window_hidden = true;
+        app.apply_backend_event(ringing(ADA, "Ada Lovelace"), true);
+        let shown = app.notifications.shown.last().expect("the call notifies");
+        assert_eq!(
+            (shown.title.as_str(), shown.body.as_str()),
+            ("ZapFast", "Incoming call")
+        );
+        assert_eq!(shown.picture, None);
+    }
+
+    #[test]
+    fn a_call_in_front_of_the_reader_shows_only_its_dialog() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = linked(directory.path(), None);
+        app.window_hidden = false;
+        app.window_focused = true;
+        app.apply_backend_event(ringing(ADA, "Ada Lovelace"), true);
+        assert!(app.notifications.shown.is_empty());
+        // Unfocused, the same call notifies with the caller.
+        let mut app = linked(directory.path(), None);
+        app.window_hidden = false;
+        app.window_focused = false;
+        app.apply_backend_event(ringing(ADA, "Ada Lovelace"), true);
+        let shown = app.notifications.shown.last().expect("the call notifies");
+        assert_eq!(
+            (shown.title.as_str(), shown.body.as_str()),
+            ("Ada Lovelace", "Incoming voice call")
+        );
+    }
+
+    #[test]
+    fn a_hidden_accounts_call_notifies_and_its_click_opens_it_there() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = linked(directory.path(), None);
+        app.attach(&ctx);
+        let events = second_account(&mut app);
+        app.window_hidden = false;
+        app.window_focused = true;
+        app.open_chat = Some(ADA.into());
+        app.composer = "visible".into();
+        events.send(ringing(GRACE, "Grace Hopper")).unwrap();
+        app.handle_events();
+
+        // The account on screen is untouched: no call, dialog or composer change.
+        assert_eq!(app.account().id, AccountId::first());
+        assert!(app.call.is_none());
+        assert!(app.dialog.is_none());
+        assert_eq!(app.composer, "visible");
+        assert_eq!(app.open_chat.as_deref(), Some(ADA));
+        assert!(
+            app.accounts[1]
+                .call
+                .as_ref()
+                .is_some_and(|call| call.incoming)
+        );
+        assert!(app.ringing_anywhere(), "the hidden account's call rings");
+        assert!(!shows_incoming_dialog(&mut app, &ctx));
+
+        let shown = app
+            .notifications
+            .shown
+            .last()
+            .expect("the call notifies")
+            .clone();
+        assert_eq!(
+            (shown.title.as_str(), shown.body.as_str()),
+            ("Grace Hopper", "Incoming voice call")
+        );
+        assert_eq!(shown.target.account.as_str(), "2");
+        assert_eq!(shown.target.call, Some(CallId(1)));
+
+        app.notification_opens.lock().unwrap().push(shown.target);
+        app.handle_notification_opens();
+        assert_eq!(app.account().id.as_str(), "2");
+        assert!(
+            !app.actions
+                .iter()
+                .any(|action| matches!(action, Action::OpenMessage { .. })),
+            "a call opens no message"
+        );
+        assert!(shows_incoming_dialog(&mut app, &ctx));
+    }
+
+    #[test]
+    fn a_hidden_accounts_call_clicked_behind_the_lock_opens_there_after_unlocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = linked(directory.path(), Some(PASSWORD));
+        let events = second_account(&mut app);
+        events.send(ringing(GRACE, "Grace Hopper")).unwrap();
+        app.handle_events();
+        let shown = app
+            .notifications
+            .shown
+            .last()
+            .expect("the call notifies")
+            .clone();
+        assert_eq!(shown.body, "Incoming call");
+        assert_eq!(shown.target.account.as_str(), "2");
+
+        app.notification_opens.lock().unwrap().push(shown.target);
+        app.handle_notification_opens();
+        assert_eq!(
+            app.account().id,
+            AccountId::first(),
+            "nothing changes while locked"
+        );
+        unlock(&mut app, &ctx);
+        assert_eq!(app.account().id.as_str(), "2");
+        assert!(app.call.as_ref().is_some_and(|call| call.incoming));
+    }
+
+    #[test]
+    fn a_hidden_accounts_call_ends_without_a_word_on_screen() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = linked(directory.path(), None);
+        let events = second_account(&mut app);
+        app.accounts[1].call = Some(CallView {
+            id: CallId(4),
+            chat: GRACE.into(),
+            name: "Grace Hopper".into(),
+            incoming: false,
+            phase: CallPhase::Ringing,
+            since: 0,
+            muted: false,
+        });
+        events
+            .send(Event::CallEnded {
+                call: CallId(4),
+                chat: GRACE.into(),
+                reason: CallEndReason::Rejected,
+            })
+            .unwrap();
+        app.handle_events();
+        assert!(app.accounts[1].call.is_none());
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn a_call_is_not_placed_while_another_account_is_in_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = linked(directory.path(), None);
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let _events = second_account(&mut app);
+        app.accounts[1].call = Some(CallView {
+            id: CallId(2),
+            chat: GRACE.into(),
+            name: "Grace Hopper".into(),
+            incoming: false,
+            phase: CallPhase::Connected,
+            since: 0,
+            muted: false,
+        });
+        let placed = |commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>| {
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::StartCall(_)))
+        };
+        app.apply(Action::StartCall(ADA.into()), &ctx);
+        assert!(!placed(&mut commands));
+        assert!(app.toasts.iter().any(|toast| toast.kind == ToastKind::Info));
+
+        app.accounts[1].call = None;
+        app.apply(Action::StartCall(ADA.into()), &ctx);
+        assert!(placed(&mut commands));
     }
 }

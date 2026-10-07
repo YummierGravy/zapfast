@@ -32,12 +32,14 @@ impl Badge {
 
 /// Chat and message a clicked notification opens. The message id travels with
 /// the click, so the reader lands on what was announced instead of on the end
-/// of the chat.
+/// of the chat. A call's notification carries the call instead: its click
+/// switches to the account, where the call's own dialog shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationTarget {
     pub account: crate::model::AccountId,
     pub chat: String,
     pub message: String,
+    pub call: Option<crate::model::CallId>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -67,8 +69,16 @@ fn macos_application_ready() -> bool {
 /// until the process ran out of descriptors and aborted.
 const WAITING_LIMIT: usize = 32;
 
-type PendingByAccountChat =
-    std::collections::HashMap<(String, String), Vec<(u64, tokio::sync::oneshot::Sender<Stop>)>>;
+/// What a waiting notification announced: a chat's messages, which reading
+/// the chat closes, or a call, which closes when the call stops ringing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Subject {
+    Chat(String),
+    Call(crate::model::CallId),
+}
+
+type PendingByAccountSubject =
+    std::collections::HashMap<(String, Subject), Vec<(u64, tokio::sync::oneshot::Sender<Stop>)>>;
 
 /// How a notification stops waiting for a click.
 #[derive(Debug, PartialEq, Eq)]
@@ -95,7 +105,7 @@ fn before_showing(cancelled: &mut tokio::sync::oneshot::Receiver<Stop>) -> Optio
 /// its notification is still being delivered cannot leave a stale notification.
 #[derive(Default)]
 pub struct Notifications {
-    pending: PendingByAccountChat,
+    pending: PendingByAccountSubject,
     /// Order of registration, so the oldest waiting notification is released first.
     registered: u64,
     /// What unit tests would have shown, recorded instead of shown on the
@@ -110,13 +120,25 @@ pub struct Shown {
     pub body: String,
     pub picture: Option<PathBuf>,
     pub sound: NotificationSound,
+    /// What a click on it would open.
+    pub target: NotificationTarget,
 }
 
 impl Notifications {
+    /// Registers a chat's notification; delivery registers through `show`.
+    #[cfg(test)]
     fn register(
         &mut self,
         account: &crate::model::AccountId,
         chat: &str,
+    ) -> tokio::sync::oneshot::Receiver<Stop> {
+        self.register_subject(account, Subject::Chat(chat.to_owned()))
+    }
+
+    fn register_subject(
+        &mut self,
+        account: &crate::model::AccountId,
+        subject: Subject,
     ) -> tokio::sync::oneshot::Receiver<Stop> {
         self.pending.retain(|_, entries| {
             entries.retain(|(_, entry)| !entry.is_closed());
@@ -128,7 +150,7 @@ impl Notifications {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         self.registered += 1;
         self.pending
-            .entry((account.as_str().to_owned(), chat.to_owned()))
+            .entry((account.as_str().to_owned(), subject))
             .or_default()
             .push((self.registered, cancel));
         cancelled
@@ -139,7 +161,7 @@ impl Notifications {
             .pending
             .iter()
             .flat_map(|(key, entries)| entries.iter().map(move |(order, _)| (*order, key)))
-            .min()
+            .min_by_key(|(order, _)| *order)
             .map(|(order, key)| (order, key.clone()));
         let Some((order, key)) = oldest else {
             return;
@@ -156,10 +178,16 @@ impl Notifications {
     }
 
     pub fn clear(&mut self, account: &crate::model::AccountId, chat: &str) {
-        if let Some(entries) = self
-            .pending
-            .remove(&(account.as_str().to_owned(), chat.to_owned()))
-        {
+        self.close(account, Subject::Chat(chat.to_owned()));
+    }
+
+    /// Takes a call's notification away once it no longer rings.
+    pub fn clear_call(&mut self, account: &crate::model::AccountId, call: crate::model::CallId) {
+        self.close(account, Subject::Call(call));
+    }
+
+    fn close(&mut self, account: &crate::model::AccountId, subject: Subject) {
+        if let Some(entries) = self.pending.remove(&(account.as_str().to_owned(), subject)) {
             for (_, cancel) in entries {
                 let _ = cancel.send(Stop::Close);
             }
@@ -199,13 +227,18 @@ impl Notifications {
         opened: Arc<Mutex<Vec<NotificationTarget>>>,
         wake: impl Fn() + Send + 'static,
     ) {
-        let cancelled = self.register(&target.account, &target.chat);
+        let subject = match target.call {
+            Some(call) => Subject::Call(call),
+            None => Subject::Chat(target.chat.clone()),
+        };
+        let cancelled = self.register_subject(&target.account, subject);
         if cfg!(test) {
             self.shown.push(Shown {
                 title,
                 body,
                 picture,
                 sound,
+                target,
             });
             return;
         }
@@ -279,6 +312,28 @@ pub fn locked_lines(locale: crate::i18n::Locale) -> (String, String) {
         "ZapFast".to_owned(),
         crate::i18n::gettext(locale, "New message").into_owned(),
     )
+}
+
+/// The title and body of an incoming call while the app lock is on, which
+/// name neither the caller nor their number.
+pub fn locked_call_lines(locale: crate::i18n::Locale) -> (String, String) {
+    (
+        "ZapFast".to_owned(),
+        crate::i18n::gettext(locale, "Incoming call").into_owned(),
+    )
+}
+
+/// The title and body of an incoming call: the caller and what they call with.
+pub fn call_lines(
+    locale: crate::i18n::Locale,
+    caller: &str,
+    media: crate::model::CallMedia,
+) -> (String, String) {
+    let body = match media {
+        crate::model::CallMedia::Voice => crate::i18n::gettext(locale, "Incoming voice call"),
+        crate::model::CallMedia::Video => crate::i18n::gettext(locale, "Incoming video call"),
+    };
+    (caller.to_owned(), body.into_owned())
 }
 
 /// Builds the notification title and body, including the group sender.
@@ -494,7 +549,7 @@ mod tests {
         assert!(
             !notifications
                 .pending
-                .contains_key(&("1".into(), "a".into()))
+                .contains_key(&("1".into(), Subject::Chat("a".into())))
         );
     }
 
@@ -574,6 +629,7 @@ mod tests {
                 account: crate::model::AccountId::first(),
                 chat: "test".into(),
                 message: "test-message".into(),
+                call: None,
             },
             Default::default(),
             || {},
@@ -594,6 +650,39 @@ mod tests {
         );
         notifications.clear(&second, "shared");
         assert_eq!(theirs.try_recv(), Ok(Stop::Close));
+    }
+
+    #[test]
+    fn a_call_closes_only_its_own_notification() {
+        use crate::model::CallId;
+        use tokio::sync::oneshot::error::TryRecvError;
+        let mut notifications = Notifications::default();
+        let one = account("1");
+        let mut message = notifications.register(&one, "a");
+        let mut ringing = notifications.register_subject(&one, Subject::Call(CallId(7)));
+        let mut elsewhere = notifications.register_subject(&account("2"), Subject::Call(CallId(7)));
+        // Reading the caller's chat leaves the call ringing, and the end of
+        // the call leaves the chat's messages and the other account's call.
+        notifications.clear(&one, "a");
+        assert_eq!(message.try_recv(), Ok(Stop::Close));
+        assert_eq!(ringing.try_recv(), Err(TryRecvError::Empty));
+        notifications.clear_call(&one, CallId(7));
+        assert_eq!(ringing.try_recv(), Ok(Stop::Close));
+        assert_eq!(elsewhere.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn a_locked_call_names_nobody() {
+        let locale = crate::i18n::Locale::English;
+        let (title, body) = locked_call_lines(locale);
+        assert_eq!(
+            (title.as_str(), body.as_str()),
+            ("ZapFast", "Incoming call")
+        );
+        assert_eq!(
+            call_lines(locale, "Ada Lovelace", crate::model::CallMedia::Voice),
+            ("Ada Lovelace".to_owned(), "Incoming voice call".to_owned())
+        );
     }
 
     #[test]

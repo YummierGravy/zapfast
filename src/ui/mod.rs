@@ -1,6 +1,7 @@
 //! Window layout: panels, overlays, keyboard shortcuts.
 
 pub mod accounts;
+pub mod call;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
@@ -72,6 +73,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if !macos {
         banner(app, ui);
     }
+    call::bar(app, ui);
     let narrow = narrow(ctx);
     let list_only = narrow && app.page == Page::Chats && app.current_chat().is_none();
     let view = narrow.then_some(if list_only {
@@ -89,6 +91,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     update::show(app, ctx);
     picker::show(app, ctx);
     dialogs::show(app, ctx);
+    call::incoming(app, ctx);
     image_preview::show(app, ctx);
     video_preview::show(app, ctx);
     drop_target(app, ctx);

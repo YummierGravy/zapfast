@@ -1309,6 +1309,21 @@ pub enum CallEndReason {
     Failed,
 }
 
+/// The call this account has, as the views draw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallView {
+    pub id: CallId,
+    pub chat: ChatId,
+    /// The other side's best known name.
+    pub name: String,
+    /// Whether the other side placed it.
+    pub incoming: bool,
+    pub phase: CallPhase,
+    /// When the call entered `phase`, in Unix milliseconds.
+    pub since: i64,
+    pub muted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
@@ -1341,6 +1356,15 @@ pub enum Scroll {
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    /// Places a voice call to a direct chat.
+    StartCall(ChatId),
+    AcceptCall(CallId),
+    /// Declines the call ringing here.
+    RejectCall(CallId),
+    /// Ends a call in any phase.
+    HangUp(CallId),
+    /// Mutes or unmutes the microphone in a call.
+    SetCallMuted(CallId, bool),
     Open(Page),
     /// Opens settings, or closes them when they are already showing.
     ToggleSettings,
