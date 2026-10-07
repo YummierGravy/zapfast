@@ -625,6 +625,8 @@ pub enum Command {
     HangUp(CallId),
     /// Mutes or unmutes the microphone in a call.
     SetCallMuted(CallId, bool),
+    /// Turns our camera on or off during a video call.
+    SetCallCamera(CallId, bool),
     Shutdown,
     /// Internal send result.
     Sent {
@@ -1008,10 +1010,15 @@ pub enum Event {
         muted: bool,
     },
     /// A video call is being answered: the other side's pictures arrive in
-    /// `feed`. Video is received only; nothing is sent.
+    /// `feed`.
     CallVideo {
         call: CallId,
         feed: crate::call_video::Feed,
+    },
+    /// Whether our camera is sending in a video call.
+    CallCamera {
+        call: CallId,
+        sending: bool,
     },
 }
 

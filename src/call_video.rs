@@ -1,4 +1,5 @@
-//! The other side's video in a call, received and shown; nothing is sent.
+//! The other side's video in a call, received and shown, and our camera when
+//! it can be opened.
 //!
 //! The library hands over H.264 access units in Annex B form
 //! ([`VideoFrame`]). [`Reception`] decodes them with `openh264` (as `video`
@@ -268,15 +269,12 @@ impl Ask {
     }
 }
 
-/// Receives the other side's video for one call: a decode thread, the
-/// [`Feed`] it fills, and the ends the library holds. Dropping it stops the
-/// thread.
+/// Receives the other side's video for one call, and sends ours when the
+/// camera is on. Dropping it stops both threads.
 pub struct Reception {
     feed: Feed,
     frames: async_channel::Sender<VideoFrame>,
-    /// A camera that sends nothing. Kept open: video is received only.
-    camera: async_channel::Sender<Vec<u8>>,
-    source: async_channel::Receiver<Vec<u8>>,
+    camera: std::sync::Arc<crate::call_camera::Sending>,
     ask: Ask,
 }
 
@@ -293,12 +291,10 @@ impl Reception {
                 .name("call-video".into())
                 .spawn(move || run(&incoming, &feed, &ask))?;
         }
-        let (camera, source) = async_channel::bounded(1);
         Ok(Self {
             feed,
             frames,
-            camera,
-            source,
+            camera: std::sync::Arc::new(crate::call_camera::Sending::silent()),
             ask,
         })
     }
@@ -312,10 +308,36 @@ impl Reception {
         self.frames.clone()
     }
 
-    /// The library needs a camera to answer with video; this one never
-    /// sends a frame.
+    /// Where the library reads our encoded pictures. Empty until
+    /// [`Reception::arm_camera`].
     pub fn source(&self) -> async_channel::Receiver<Vec<u8>> {
-        self.source.clone()
+        self.camera.source()
+    }
+
+    /// The camera state, shared with the task that opens it.
+    pub fn camera(&self) -> std::sync::Arc<crate::call_camera::Sending> {
+        std::sync::Arc::clone(&self.camera)
+    }
+
+    /// Opens the default camera. False leaves the source silent; [`Reception::notice`]
+    /// then says why.
+    pub fn arm_camera(&self) -> bool {
+        self.camera.arm()
+    }
+
+    /// Whether pictures are being encoded for the other side.
+    pub fn sending(&self) -> bool {
+        self.camera.sending()
+    }
+
+    /// Why the camera is off, when the person should be told.
+    pub fn notice(&self) -> Option<String> {
+        self.camera.notice()
+    }
+
+    /// Stops encoding. The source stays open and silent.
+    pub fn halt_camera(&self) {
+        self.camera.halt()
     }
 
     /// How to ask the other side for a keyframe, once the call exists.
@@ -327,7 +349,7 @@ impl Reception {
 impl Drop for Reception {
     fn drop(&mut self) {
         self.frames.close();
-        self.camera.close();
+        self.camera.release();
     }
 }
 

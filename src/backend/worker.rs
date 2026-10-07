@@ -5618,6 +5618,7 @@ impl Worker {
             Command::AcceptCall(call) => self.accept_call(call),
             Command::RejectCall(call) | Command::HangUp(call) => self.hang_up_call(call),
             Command::SetCallMuted(call, muted) => self.mute_call(call, muted),
+            Command::SetCallCamera(call, on) => self.set_call_camera(call, on),
             Command::FavoritesSent {
                 through,
                 at,

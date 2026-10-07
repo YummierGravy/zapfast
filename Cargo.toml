@@ -196,6 +196,9 @@ zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-tokio-c
 zbus = { version = "5.19", default-features = false, features = ["blocking-api", "tokio"] }
 # Reads the time locale's clock format.
 libc = "0.2"
+# The default camera while sending video in a call. The other systems compile
+# without it and still receive video.
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-v4l", "decoding"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }

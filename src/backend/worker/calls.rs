@@ -13,10 +13,9 @@
 //! answered first, or we hung up while dialling) has the handle its setup
 //! made terminated and its audio closed, instead of coming back to life.
 //!
-//! A video call is answered with video, as the library requires, from a
-//! camera that sends nothing, and our video is then turned off, so the other
-//! side's video is received and shown but none is sent. Calls placed here
-//! are voice calls.
+//! A video call is answered with video. On Linux the default camera is
+//! encoded and sent; if it cannot be opened, our video is turned off and
+//! only the other side is shown. Calls placed here are voice calls.
 //!
 //! A second offer while a call rings or runs is declined at once. The
 //! library at this revision sends a reject without a reason, so the caller
@@ -72,6 +71,13 @@ pub(super) enum Report {
     Over { id: CallId, failed: bool },
     /// The microphone's state after a mute or unmute.
     Muted { id: CallId, muted: bool },
+    /// Whether our camera is sending, after it was opened or the person
+    /// turned it. `notice` is set when turning it on failed.
+    Camera {
+        id: CallId,
+        sending: bool,
+        notice: Option<String>,
+    },
 }
 
 /// What the other side's signalling said about a call.
@@ -162,6 +168,15 @@ impl<H> Default for Calls<H> {
 }
 
 impl Calls<Live> {
+    /// The running call's received video, when it has any.
+    fn reception(&mut self, id: CallId) -> Option<&mut Reception> {
+        self.current
+            .as_mut()
+            .filter(|call| call.id == id)
+            .and_then(|call| call.live.as_mut())
+            .and_then(|live| live.video.as_mut())
+    }
+
     /// The running call's speaker, so the line can be marked open.
     fn speaker(&mut self, id: CallId) -> Option<&mut CallAudio> {
         self.current
@@ -612,11 +627,14 @@ fn video_stops(state: VideoState) -> bool {
     )
 }
 
-/// Turns our video off in a video call just answered, leaving the other
-/// side's on, and asks for keyframes on the decoder's behalf from now on.
-async fn receive_only(id: CallId, handle: &CallHandle, video: &Reception) {
+/// Asks for keyframes on the decoder's behalf. When `sending` is false, turns
+/// our video off so the other side does not wait on a camera that is silent.
+async fn finish_video(id: CallId, handle: &CallHandle, video: &Reception, sending: bool) {
     let asking = handle.clone();
     video.on_loss(move || asking.request_peer_keyframe(KeyframeUrgency::Coalesced));
+    if sending {
+        return;
+    }
     if let Err(error) = handle.stop_video().await {
         log::info!(
             "call {}: our video could not be turned off: {}",
@@ -748,12 +766,89 @@ impl Worker {
         self.run_call_steps(steps);
     }
 
+    /// Turns our camera on or off during a video call. A voice call has no
+    /// camera to change.
+    pub(super) fn set_call_camera(&mut self, id: CallId, on: bool) {
+        let Some(handle) = self.calls.live(id).map(|live| live.handle.clone()) else {
+            return;
+        };
+        let Some(video) = self.calls.reception(id) else {
+            return;
+        };
+        if video.sending() == on {
+            return;
+        }
+        let camera = video.camera();
+        let sink = video.sink();
+        let sender = self.wa_sender.clone();
+        tokio::spawn(async move {
+            let (sending, notice) = if on {
+                let camera_for_open = std::sync::Arc::clone(&camera);
+                let opened = tokio::task::spawn_blocking(move || camera_for_open.arm())
+                    .await
+                    .unwrap_or(false);
+                if opened {
+                    match handle.resume_video(camera.source(), sink).await {
+                        Ok(()) => (true, None),
+                        Err(error) => {
+                            log::warn!(
+                                "call {}: the camera could not be turned on: {}",
+                                id.0,
+                                error_label(&error)
+                            );
+                            let closing = std::sync::Arc::clone(&camera);
+                            tokio::task::spawn_blocking(move || closing.halt())
+                                .await
+                                .ok();
+                            (
+                                false,
+                                camera
+                                    .notice()
+                                    .or(Some("The camera could not be turned on.".to_owned())),
+                            )
+                        }
+                    }
+                } else {
+                    let notice = camera
+                        .notice()
+                        .unwrap_or_else(|| "No camera was found.".to_owned());
+                    (false, Some(notice))
+                }
+            } else {
+                let closing = std::sync::Arc::clone(&camera);
+                tokio::task::spawn_blocking(move || closing.halt())
+                    .await
+                    .ok();
+                if let Err(error) = handle.stop_video().await {
+                    log::info!(
+                        "call {}: our video could not be turned off: {}",
+                        id.0,
+                        error_label(&error)
+                    );
+                }
+                (false, None)
+            };
+            let _ = sender.send(RuntimeEvent::Call(Report::Camera {
+                id,
+                sending,
+                notice,
+            }));
+        });
+    }
+
     pub(super) fn call_report(&mut self, report: Report) {
         let steps = match report {
             Report::Started { id, result } => {
                 let result = match result {
                     Ok(live) => {
                         let protocol = live.handle.call_id().to_owned();
+                        if let Some(video) = &live.video {
+                            let sending = video.sending();
+                            self.emit(Event::CallCamera { call: id, sending });
+                            if !sending && let Some(notice) = video.notice() {
+                                self.emit(Event::Error(notice));
+                            }
+                        }
                         Ok((*live, protocol))
                     }
                     Err(failure) => {
@@ -767,6 +862,17 @@ impl Worker {
             }
             Report::Over { id, failed } => self.calls.over(id, failed, now()),
             Report::Muted { id, muted } => self.calls.muted(id, muted),
+            Report::Camera {
+                id,
+                sending,
+                notice,
+            } => {
+                self.emit(Event::CallCamera { call: id, sending });
+                if let Some(notice) = notice {
+                    self.emit(Event::Error(notice));
+                }
+                return;
+            }
         };
         self.run_call_steps(steps);
     }
@@ -821,6 +927,15 @@ impl Worker {
                 let video = self.receive_video(id, &offer);
                 let sender = self.wa_sender.clone();
                 tokio::spawn(async move {
+                    let sending = match &video {
+                        Some(video) => {
+                            let camera = video.camera();
+                            tokio::task::spawn_blocking(move || camera.arm())
+                                .await
+                                .unwrap_or(false)
+                        }
+                        None => false,
+                    };
                     let result = match open_audio(false).await {
                         Ok((audio, ends)) => {
                             let voip = client.voip();
@@ -832,7 +947,7 @@ impl Worker {
                             match accept.start().await {
                                 Ok(handle) => {
                                     if let Some(video) = &video {
-                                        receive_only(id, &handle, video).await;
+                                        finish_video(id, &handle, video, sending).await;
                                     }
                                     Ok(Live {
                                         handle,

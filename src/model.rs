@@ -1324,6 +1324,8 @@ pub struct CallView {
     /// When the call entered `phase`, in Unix milliseconds.
     pub since: i64,
     pub muted: bool,
+    /// Whether our camera is sending.
+    pub camera: bool,
     /// The other side's video, once a video call is answered.
     pub video: Option<crate::call_video::Feed>,
 }
@@ -1369,6 +1371,8 @@ pub enum Action {
     HangUp(CallId),
     /// Mutes or unmutes the microphone in a call.
     SetCallMuted(CallId, bool),
+    /// Turns our camera on or off during a video call.
+    SetCallCamera(CallId, bool),
     Open(Page),
     /// Opens settings, or closes them when they are already showing.
     ToggleSettings,

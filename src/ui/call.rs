@@ -205,7 +205,11 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                 };
                 theme::icon(ui, icon, 18.0, palette.accent);
                 ui.add_space(4.0);
-                let name_width = (ui.available_width() - 2.0 * (BUTTON * 0.75 + 8.0)).max(60.0);
+                let small = BUTTON * 0.75;
+                let camera_button =
+                    call.media == CallMedia::Video && call.phase == CallPhase::Connected;
+                let buttons = if camera_button { 3.0 } else { 2.0 };
+                let name_width = (ui.available_width() - buttons * (small + 8.0)).max(60.0);
                 ui.allocate_ui_with_layout(
                     vec2(name_width, BUTTON * 0.75),
                     Layout::left_to_right(Align::Center),
@@ -227,7 +231,6 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                     },
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let small = BUTTON * 0.75;
                     if round_button(
                         ui,
                         Icon::PhoneOff,
@@ -247,6 +250,27 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                     };
                     if round_button(ui, icon, small, fill, color, label).clicked() {
                         app.actions.push(Action::SetCallMuted(call.id, !call.muted));
+                    }
+                    if camera_button {
+                        let (icon, label, fill, color) = if call.camera {
+                            (
+                                Icon::Video,
+                                "Turn camera off",
+                                palette.outline,
+                                palette.text,
+                            )
+                        } else {
+                            (
+                                Icon::VideoOff,
+                                "Turn camera on",
+                                palette.text,
+                                palette.panel,
+                            )
+                        };
+                        if round_button(ui, icon, small, fill, color, label).clicked() {
+                            app.actions
+                                .push(Action::SetCallCamera(call.id, !call.camera));
+                        }
                     }
                 });
             });
@@ -322,6 +346,7 @@ mod tests {
             phase: CallPhase::Ringing,
             since: 0,
             muted: false,
+            camera: false,
             video: None,
         };
         assert_eq!(status(&call, 0), "Incoming video call");

@@ -9,6 +9,7 @@ pub mod audio;
 pub mod autostart;
 pub mod backend;
 pub mod bidi;
+mod call_camera;
 pub mod call_video;
 #[cfg(any(test, feature = "demo"))]
 pub mod demo;

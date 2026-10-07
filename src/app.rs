@@ -2978,6 +2978,7 @@ impl App {
                     phase: CallPhase::Ringing,
                     since: 0,
                     muted: false,
+                    camera: false,
                     video: None,
                 });
             }
@@ -2991,6 +2992,11 @@ impl App {
             Event::CallMuted { call, muted } => {
                 if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
                     view.muted = muted;
+                }
+            }
+            Event::CallCamera { call, sending } => {
+                if let Some(view) = self.call.as_mut().filter(|view| view.id == call) {
+                    view.camera = sending;
                 }
             }
             Event::CallVideo { call, feed } => {
@@ -3027,6 +3033,7 @@ impl App {
                     phase,
                     since,
                     muted: false,
+                    camera: false,
                     video: None,
                 });
             }
@@ -4894,6 +4901,9 @@ impl App {
             }
             Action::SetCallMuted(call, muted) => {
                 self.backend.send(Command::SetCallMuted(call, muted));
+            }
+            Action::SetCallCamera(call, on) => {
+                self.backend.send(Command::SetCallCamera(call, on));
             }
             Action::PlayVoice { message, path } => self.play_voice(message, path),
             Action::PlayVideo { message, path } => self.play_video(message, path),
@@ -12625,6 +12635,45 @@ mod call_tests {
     }
 
     #[test]
+    fn the_camera_button_follows_whether_we_are_sending() {
+        let mut app = app();
+        app.apply_backend_event(
+            Event::CallIncoming {
+                call: CallId(5),
+                chat: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                media: CallMedia::Video,
+            },
+            true,
+        );
+        assert!(app.call.as_ref().is_some_and(|call| !call.camera));
+        app.apply_backend_event(
+            Event::CallCamera {
+                call: CallId(4),
+                sending: true,
+            },
+            true,
+        );
+        assert!(app.call.as_ref().is_some_and(|call| !call.camera));
+        app.apply_backend_event(
+            Event::CallCamera {
+                call: CallId(5),
+                sending: true,
+            },
+            true,
+        );
+        assert!(app.call.as_ref().is_some_and(|call| call.camera));
+        app.apply_backend_event(
+            Event::CallCamera {
+                call: CallId(5),
+                sending: false,
+            },
+            true,
+        );
+        assert!(app.call.as_ref().is_some_and(|call| !call.camera));
+    }
+
+    #[test]
     fn declining_or_hanging_up_clears_the_call_at_once() {
         for hang_up in [false, true] {
             let mut app = app();
@@ -12920,6 +12969,7 @@ mod call_tests {
             phase: CallPhase::Ringing,
             since: 0,
             muted: false,
+            camera: false,
             video: None,
         });
         events
@@ -12951,6 +13001,7 @@ mod call_tests {
             phase: CallPhase::Connected,
             since: 0,
             muted: false,
+            camera: false,
             video: None,
         });
         let placed = |commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>| {

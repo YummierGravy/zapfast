@@ -2192,6 +2192,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     },
                     since: crate::util::now() * 1000 - 83_000,
                     muted: false,
+                    camera: video.is_some(),
                     video,
                 });
             }
